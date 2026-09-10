@@ -444,8 +444,44 @@ impl Settings {
             cfg!(feature = "cuda"),
         )?;
 
+        validate_auth(&s.auth)?;
+
         Ok(s)
     }
+}
+
+/// Fail-closed validation of the auth settings, run from Settings::load at
+/// startup — before any token is ever signed. HS256's security is bounded by
+/// the key: a short or empty `AUTH__JWT_SECRET` still produces tokens that
+/// look valid, but anyone can brute-force the key and forge sessions for any
+/// user, bypassing the password check entirely. Likewise an expiry of zero
+/// issues tokens that expire immediately (a self-inflicted denial of
+/// service), and an expiry whose value in seconds does not fit in a u64
+/// cannot be represented as an `exp` claim at all.
+///
+/// Extracted as a free function so it can be tested without touching real
+/// environment variables, like `validate_ingestion_embedding` below.
+fn validate_auth(auth: &AuthSettings) -> Result<()> {
+    // HMAC-SHA256 takes any key length, so a weak secret is never rejected
+    // downstream — it must be rejected here. 32 bytes = 256 bits, the same
+    // strength as the hash itself; `.env.example` already suggests
+    // `openssl rand -hex 32`, which yields exactly that.
+    if auth.jwt_secret.len() < 32 {
+        anyhow::bail!(
+            "AUTH__JWT_SECRET must be at least 32 characters (256 bits) — generate one with \
+             `openssl rand -hex 32`. Short secrets let anyone brute-force the signing key \
+             and forge session tokens."
+        );
+    }
+    if auth.jwt_expiry_minutes == 0 {
+        anyhow::bail!(
+            "AUTH__JWT_EXPIRY_MINUTES must be greater than 0 — 0 issues tokens that expire immediately."
+        );
+    }
+    if auth.jwt_expiry_minutes.checked_mul(60).is_none() {
+        anyhow::bail!("AUTH__JWT_EXPIRY_MINUTES is too large: its value in seconds overflows u64.");
+    }
+    Ok(())
 }
 
 /// Extracted from Settings::load so it can be tested without touching real
@@ -565,5 +601,43 @@ mod tests {
         let err = validate_ingestion_embedding(IngestionEmbedding::CandleGpu, true, true, true)
             .unwrap_err();
         assert!(err.to_string().contains("RESERVE_EMBEDDING_MODEL"));
+    }
+
+    fn auth_with(secret: &str, expiry_minutes: u64) -> AuthSettings {
+        AuthSettings {
+            jwt_secret: secret.to_owned(),
+            jwt_expiry_minutes: expiry_minutes,
+            admin_default_password: None,
+        }
+    }
+
+    #[test]
+    fn valid_auth_passes() {
+        assert!(validate_auth(&auth_with(&"s".repeat(32), 480)).is_ok());
+        // Longer-than-minimum secrets stay valid.
+        assert!(validate_auth(&auth_with(&"s".repeat(64), 480)).is_ok());
+    }
+
+    #[test]
+    fn short_or_empty_secret_fails() {
+        for secret in ["", "x", "short-secret", &"s".repeat(31)] {
+            let err = validate_auth(&auth_with(secret, 480)).unwrap_err();
+            assert!(
+                err.to_string().contains("AUTH__JWT_SECRET"),
+                "secret={secret:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_expiry_fails() {
+        let err = validate_auth(&auth_with(&"s".repeat(32), 0)).unwrap_err();
+        assert!(err.to_string().contains("AUTH__JWT_EXPIRY_MINUTES"));
+    }
+
+    #[test]
+    fn overflowing_expiry_fails() {
+        let err = validate_auth(&auth_with(&"s".repeat(32), u64::MAX)).unwrap_err();
+        assert!(err.to_string().contains("AUTH__JWT_EXPIRY_MINUTES"));
     }
 }

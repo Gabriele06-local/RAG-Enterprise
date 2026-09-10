@@ -15,6 +15,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Startup now rejects a weak `AUTH__JWT_SECRET` instead of signing tokens
+  with it.** Any secret shorter than 32 characters (and a zero or
+  overflowing `AUTH__JWT_EXPIRY_MINUTES`) fails fast in `Settings::load`
+  with instructions (`openssl rand -hex 32`); previously an empty or
+  single-character secret started normally, producing HS256 tokens anyone
+  could brute-force and forge. `jwt::create_token` also returns an error
+  instead of panicking/wrapping on an out-of-range expiry.
+
 ---
 
 ## [0.1.38] - 2026-08-22
