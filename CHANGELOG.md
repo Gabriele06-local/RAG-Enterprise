@@ -15,6 +15,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+---
+
+## [0.1.40] - 2026-09-11
+
+### Changed
+
+- **Upgrading to this release can stop an existing deployment from
+  starting, and that is deliberate.** The `AUTH__JWT_SECRET` validation
+  below is fail-closed: any installation currently running with a secret
+  shorter than 32 characters will refuse to start until that secret is
+  replaced (`openssl rand -hex 32`). Such a deployment was already
+  forgeable, so refusing to start is the correct outcome — but it is a
+  breaking change on upgrade, so check the secret before rolling this out
+  rather than discovering it at the next restart. Note that replacing the
+  secret invalidates every token in circulation: all users have to log in
+  again.
+
 ### Fixed
 
 - **Startup now rejects a weak `AUTH__JWT_SECRET` instead of signing tokens
