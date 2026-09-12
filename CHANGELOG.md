@@ -15,6 +15,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A single malformed SSE line no longer discards a whole streaming
+  answer.** `JSON.parse` on a `data:` line ran unguarded inside the
+  stream loop, so one truncated chunk (flaky network) threw into the
+  outer `catch` and replaced the partial answer with a generic error.
+  Malformed lines are now skipped, keeping the tokens received so far.
+  The upload progress bar is also guarded against a missing
+  `evt.total` (chunked encoding), which previously rendered as `NaN%`.
+
 ---
 
 ## [0.1.40] - 2026-09-11
