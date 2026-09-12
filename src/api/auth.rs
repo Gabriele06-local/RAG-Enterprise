@@ -170,6 +170,17 @@ pub async fn change_password(
         }
     }
 
+    // Enforce server-side the floor the UI advertises (plus a ceiling it
+    // never had): without this, a direct API call could set an empty or
+    // gigabyte-long password regardless of what the form allows.
+    if let Err(e) = password::validate_new_password(&body.new_password) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+
     let new_hash = match password::hash(&body.new_password) {
         Ok(h) => h,
         Err(e) => {
