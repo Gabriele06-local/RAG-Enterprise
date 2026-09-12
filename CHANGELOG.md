@@ -25,6 +25,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   The upload progress bar is also guarded against a missing
   `evt.total` (chunked encoding), which previously rendered as `NaN%`.
 
+- **`POST /api/auth/change-password` now enforces a password policy
+  instead of accepting anything.** An empty (or up to 5-character) new
+  password was hashed and stored without complaint via a direct API call —
+  the 6-character floor only existed in the frontend form — and there was
+  no upper bound at all, so a megabyte-long password fed straight into
+  Argon2. The endpoint now rejects passwords shorter than 6 or longer
+  than 128 characters with a 400, enforced by a tested
+  `auth::password::validate_new_password`.
+
 ---
 
 ## [0.1.40] - 2026-09-11
