@@ -17,6 +17,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A single malformed SSE line no longer discards a whole streaming
+  answer.** `JSON.parse` on a `data:` line ran unguarded inside the
+  stream loop, so one truncated chunk (flaky network) threw into the
+  outer `catch` and replaced the partial answer with a generic error.
+  Malformed lines are now skipped, keeping the tokens received so far.
+  The upload progress bar is also guarded against a missing
+  `evt.total` (chunked encoding), which previously rendered as `NaN%`.
+
 - **`POST /api/auth/change-password` now enforces a password policy
   instead of accepting anything.** An empty (or up to 5-character) new
   password was hashed and stored without complaint via a direct API call —

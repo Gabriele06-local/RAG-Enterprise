@@ -500,7 +500,8 @@ function App() {
     try {
       const response = await axios.post(`${API_URL}/api/documents/upload`, formData, {
         onUploadProgress: (evt) => {
-          setUploadProgress(Math.round((evt.loaded * 100) / evt.total))
+          // evt.total può mancare (chunked encoding): senza, il calcolo dà NaN
+          if (evt.total) setUploadProgress(Math.round((evt.loaded * 100) / evt.total))
         }
       })
       setUploadProgress(100)
@@ -618,7 +619,12 @@ function App() {
         for (const raw of events) {
           const dataLine = raw.split('\n').find(l => l.startsWith('data: '))
           if (!dataLine) continue // keep-alive SSE o blocco senza payload
-          const payload = JSON.parse(dataLine.slice('data: '.length))
+          let payload
+          try {
+            payload = JSON.parse(dataLine.slice('data: '.length))
+          } catch {
+            continue // riga malformata (rete instabile): salta la riga, non lo stream
+          }
 
           if (payload.token !== undefined) {
             appendToken(payload.token)
