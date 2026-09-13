@@ -78,6 +78,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- **A question now has a maximum length, and the embedder truncates
+  regardless.** The only limit was axum's 2 MB default body: a question
+  that size was tokenised whole, embedded on the CPU, and pasted into the
+  prompt, so any authenticated account — including a plain `user`, who
+  cannot upload anything — could spend minutes of CPU and gigabytes of
+  memory per request, repeatedly. Questions over 4000 characters are now
+  refused with a 400 before any of that happens, and the tokenizer is
+  configured with bge-m3's own 8192-position limit at load time, so the
+  bound holds for every caller rather than only this one endpoint.
+
+- **DOCX and XLSX are refused when they declare more than 512 MiB
+  uncompressed.** Both formats are zip archives that the parsers inflate
+  into memory in one go, and the upload limit only ever bounded the
+  *compressed* file — a thousand-to-one ratio is trivial, so a few
+  kilobytes on the wire could become gigabytes of resident memory, fatal on
+  the ARM64 boards this project ships builds for. The check reads the
+  archive's central directory only, so nothing is decompressed to run it.
+  It stops the ordinary bomb, which declares its real size; an archive that
+  lies about its sizes needs the decompression itself to run through a
+  capped reader, and that is left for its own change.
+
 - **A token's claims are now re-checked against the database on every
   request.** The role and identity were taken from the JWT and believed as
   written, so deactivating a user, demoting an administrator, or changing a

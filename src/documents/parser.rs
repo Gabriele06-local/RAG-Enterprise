@@ -155,6 +155,7 @@ fn extract_pdf(path: &Path, data_dir: &Path) -> Result<ExtractedText> {
 // ── DOCX ──────────────────────────────────────────────────────────────────────
 
 fn extract_docx(path: &Path) -> Result<String> {
+    reject_decompression_bomb(path, "docx")?;
     let bytes = std::fs::read(path)
         .with_context(|| format!("reading docx {}", path.display()))?;
     let docx = docx_rs::read_docx(&bytes)
@@ -207,6 +208,7 @@ fn push_paragraph_text(out: &mut String, para: &docx_rs::Paragraph) {
 
 fn extract_xlsx(path: &Path) -> Result<String> {
     use calamine::{open_workbook_auto, Reader};
+    reject_decompression_bomb(path, "xlsx")?;
     let mut wb = open_workbook_auto(path)
         .with_context(|| format!("calamine open {}", path.display()))?;
     let mut out = String::new();
@@ -220,6 +222,73 @@ fn extract_xlsx(path: &Path) -> Result<String> {
         }
     }
     Ok(out)
+}
+
+// ── Decompression bombs ───────────────────────────────────────────────────────
+
+/// Ceiling on the total uncompressed size of a DOCX or XLSX.
+///
+/// Both formats are zip archives, and both parsers inflate them into memory
+/// in one go. The upload limit only bounds the COMPRESSED file, and a
+/// thousand-to-one ratio is trivial to produce, so a few kilobytes on the
+/// wire could become gigabytes of resident memory — fatal on the ARM64
+/// boards this project ships builds for, where RAM is already shared with
+/// the language and embedding models.
+///
+/// 512 MiB is far above any genuine office document and far below what would
+/// hurt.
+const MAX_UNCOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
+
+/// `Err(total)` as soon as the running total passes the ceiling, `Ok(())`
+/// otherwise.
+///
+/// A free function over an iterator of sizes so the arithmetic — including
+/// the saturating add that stops a crafted set of sizes from wrapping the
+/// total back to something small — can be tested without building a real
+/// bomb on disk, in the same spirit as `validate_auth` and
+/// `validate_new_password` elsewhere in this codebase.
+fn total_within_limit(sizes: impl Iterator<Item = u64>) -> Result<u64, u64> {
+    let mut total: u64 = 0;
+    for size in sizes {
+        total = total.saturating_add(size);
+        if total > MAX_UNCOMPRESSED_BYTES {
+            return Err(total);
+        }
+    }
+    Ok(total)
+}
+
+/// Refuses a zip-based document whose entries declare more uncompressed bytes
+/// than `MAX_UNCOMPRESSED_BYTES`, before any parser inflates it.
+///
+/// Reads the central directory only — `ZipEntry::size()` is a header field,
+/// so nothing is decompressed to run this check.
+///
+/// Known limit, stated rather than implied: the declared size is part of the
+/// archive and therefore also attacker-controlled. This stops the ordinary
+/// bomb, which declares its real (enormous) size because that is what makes
+/// it inflate; it does not stop an archive that lies about its sizes.
+/// Catching that needs the decompression itself to run through a capped
+/// reader, which means either patching the parsers or decompressing twice —
+/// worth doing, but not at this price.
+fn reject_decompression_bomb(path: &Path, kind: &str) -> Result<()> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("opening {kind} {}", path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("{kind} is not a readable zip archive: {}", path.display()))?;
+
+    let sizes = (0..archive.len()).map(|i| archive.by_index_raw(i).map(|e| e.size()).unwrap_or(0));
+
+    match total_within_limit(sizes) {
+        Ok(total) => {
+            tracing::debug!(file = %path.display(), uncompressed = total, "{kind} size check ok");
+            Ok(())
+        }
+        Err(total) => anyhow::bail!(
+            "{kind} refused: its entries declare at least {total} bytes uncompressed, \
+             over the {MAX_UNCOMPRESSED_BYTES} byte limit"
+        ),
+    }
 }
 
 // ── HTML ──────────────────────────────────────────────────────────────────────
@@ -244,6 +313,40 @@ mod tests {
 
     fn span(page: u32, start: usize, end: usize) -> PageSpan {
         PageSpan { page, start_byte: start, end_byte: end }
+    }
+
+    #[test]
+    fn ordinary_documents_are_under_the_limit() {
+        // A few megabytes across a handful of parts: an unremarkable DOCX.
+        let sizes = [12_000u64, 3_500_000, 48_000, 900_000];
+        assert_eq!(
+            total_within_limit(sizes.into_iter()),
+            Ok(sizes.iter().sum::<u64>())
+        );
+    }
+
+    #[test]
+    fn the_limit_itself_is_allowed() {
+        assert_eq!(
+            total_within_limit(std::iter::once(MAX_UNCOMPRESSED_BYTES)),
+            Ok(MAX_UNCOMPRESSED_BYTES)
+        );
+        assert!(total_within_limit(std::iter::once(MAX_UNCOMPRESSED_BYTES + 1)).is_err());
+    }
+
+    /// The classic shape: many small entries that add up to far too much.
+    #[test]
+    fn many_entries_that_sum_past_the_limit_are_refused() {
+        let sizes = std::iter::repeat_n(64 * 1024 * 1024, 16); // 1 GiB total
+        assert!(total_within_limit(sizes).is_err());
+    }
+
+    /// A crafted set of sizes must not wrap the running total back to a
+    /// small number and slip through.
+    #[test]
+    fn absurd_sizes_cannot_overflow_the_total() {
+        let sizes = [u64::MAX, u64::MAX, 1];
+        assert!(total_within_limit(sizes.into_iter()).is_err());
     }
 
     #[test]

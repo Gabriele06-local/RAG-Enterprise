@@ -23,10 +23,15 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokenizers::Tokenizer;
+use tokenizers::{Tokenizer, TruncationParams};
 
 #[allow(dead_code)]
 pub const EMBED_DIM: usize = 1024;
+
+/// Positions bge-m3 accepts. Anything longer is truncated at tokenisation
+/// rather than carried into the forward pass — see the `with_truncation`
+/// call in `load_on`.
+const MAX_SEQUENCE_TOKENS: usize = 8192;
 const GPU_BATCH: usize = 4;
 const CPU_BATCH: usize = 2;
 /// CUDA init attempts (device plus weight loading) before settling for CPU.
@@ -201,8 +206,21 @@ impl EmbeddingService {
             serde_json::from_reader(std::fs::File::open(&config_path).context("open config")?)
                 .context("deserialize BertConfig")?;
 
-        let tokenizer = Tokenizer::from_file(&tokenizer_path)
+        let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("tokenizer load: {e}"))?;
+        // Truncation is set here rather than trusted to whatever the shipped
+        // tokenizer.json happens to carry, so it holds for EVERY caller — the
+        // ingestion path, the query path, and any future one. Without it a
+        // single oversized input is tokenised whole and then run through the
+        // model: bge-m3 accepts 8192 positions, and a longer sequence is
+        // either a hard error deep in the forward pass or a very expensive
+        // way to reach one.
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: MAX_SEQUENCE_TOKENS,
+                ..Default::default()
+            }))
+            .map_err(|e| anyhow::anyhow!("tokenizer truncation: {e}"))?;
 
         tracing::info!(model_id, "loading embedding weights (~2.3 GB)…");
         // bge-m3 = XLM-RoBERTa: weight keys prefissati con "roberta."

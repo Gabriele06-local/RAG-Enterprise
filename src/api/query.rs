@@ -27,6 +27,35 @@ use crate::db;
 use crate::rag::{prompt, retrieval, sources::Source, vector_store::ChunkPayload};
 use crate::state::AppState;
 
+/// Longest question this API will answer.
+///
+/// The only limit before was axum's 2 MB default body: a question that size
+/// was tokenised in full, embedded on the CPU, and pasted into the prompt,
+/// so any authenticated account — including a plain `user`, who cannot
+/// upload anything — could spend minutes of CPU and gigabytes of memory per
+/// request, as often as it liked. Four thousand characters is roughly two
+/// pages of prose, far past any real question, and the rejection is cheap
+/// because it happens before the embedding.
+pub const MAX_QUERY_CHARS: usize = 4_000;
+
+/// `Err(message)` when the question is empty or too long. A free function so
+/// the rule can be tested without a running server, like `validate_auth` and
+/// `validate_new_password` elsewhere in this codebase.
+pub(crate) fn validate_query(question: &str) -> Result<(), String> {
+    if question.trim().is_empty() {
+        return Err("the question is empty".to_owned());
+    }
+    // Characters, not bytes: an accented question must not count double
+    // against a limit expressed to the user in characters.
+    let len = question.chars().count();
+    if len > MAX_QUERY_CHARS {
+        return Err(format!(
+            "the question is {len} characters long; the maximum is {MAX_QUERY_CHARS}"
+        ));
+    }
+    Ok(())
+}
+
 /// Text to feed the answering LLM for one retrieved chunk: the enriched
 /// `retrieval_text` when present, otherwise the chunk's own `text`. Never
 /// the reverse — see `ChunkPayload::retrieval_text`'s doc comment.
@@ -225,6 +254,9 @@ pub async fn query(
     if state.ingestion_blocks_queries() {
         return ingestion_busy_response();
     }
+    if let Err(msg) = validate_query(&req.query) {
+        return err(StatusCode::BAD_REQUEST, msg);
+    }
     let conv_id = req.conversation_id.as_deref();
     // _timings: not instrumented — the frontend uses /api/query/stream (see
     // query_stream), which is where --bench-live records real queries.
@@ -299,6 +331,9 @@ pub async fn query_stream(
 ) -> Response {
     if state.ingestion_blocks_queries() {
         return ingestion_busy_response();
+    }
+    if let Err(msg) = validate_query(&req.query) {
+        return err(StatusCode::BAD_REQUEST, msg);
     }
     let conv_id = req.conversation_id.as_deref();
     // Run setup synchronously before opening the SSE stream so we can return
@@ -450,6 +485,32 @@ mod tests {
             provenance_id: None,
             retrieval_text: retrieval_text.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn an_empty_question_is_rejected() {
+        for q in ["", "   ", "\n\t "] {
+            assert!(validate_query(q).is_err(), "q={q:?}");
+        }
+    }
+
+    #[test]
+    fn a_question_at_the_limit_is_accepted() {
+        assert!(validate_query(&"a".repeat(MAX_QUERY_CHARS)).is_ok());
+    }
+
+    #[test]
+    fn an_oversized_question_is_rejected() {
+        let err = validate_query(&"a".repeat(MAX_QUERY_CHARS + 1)).unwrap_err();
+        assert!(err.contains(&MAX_QUERY_CHARS.to_string()), "err={err:?}");
+    }
+
+    /// Characters, not bytes: an accented question of legal length must not
+    /// be rejected for being multibyte.
+    #[test]
+    fn accented_text_counts_as_characters() {
+        assert!(validate_query(&"à".repeat(MAX_QUERY_CHARS)).is_ok());
+        assert!(validate_query(&"à".repeat(MAX_QUERY_CHARS + 1)).is_err());
     }
 
     #[test]
