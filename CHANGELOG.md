@@ -17,6 +17,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Downloaded filenames are sanitised for the `Content-Disposition`
+  header.** The stored filename comes verbatim from the multipart body
+  while `storage::path_for` only neutralises path traversal, so a name
+  containing `"`, `\` or CR/LF reached the header uninterpolated —
+  breaking out of the quoted string at best, response splitting at
+  worst. Quotes, backslashes and ASCII controls now become `_`;
+  legitimate names (including non-ASCII ones) are untouched.
+
 - **A single malformed SSE line no longer discards a whole streaming
   answer.** `JSON.parse` on a `data:` line ran unguarded inside the
   stream loop, so one truncated chunk (flaky network) threw into the

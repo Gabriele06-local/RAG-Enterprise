@@ -371,7 +371,10 @@ pub async fn download(
                 (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
                 (
                     header::CONTENT_DISPOSITION,
-                    format!("attachment; filename=\"{}\"", doc.filename),
+                    format!(
+                        "attachment; filename=\"{}\"",
+                        sanitize_header_filename(&doc.filename)
+                    ),
                 ),
             ],
             bytes,
@@ -436,4 +439,68 @@ pub(crate) async fn purge_document(state: &AppState, document_id: &str) -> anyho
     }
 
     Ok(removed)
+}
+
+/// Makes a stored filename safe to interpolate into a quoted
+/// `Content-Disposition` header value.
+///
+/// The filename is attacker-controlled (multipart `file_name()`, stored
+/// verbatim) while `storage::path_for` only neutralises *path* traversal —
+/// nothing stops `"`, `\` or CR/LF from reaching the header, where a quote
+/// or backslash breaks out of the quoted-string and CR/LF splits the
+/// response (axum 500s the download at best). Mapping the three header
+/// metacharacters plus ASCII controls to `_` keeps legitimate names —
+/// including non-ASCII ones like `Relazione 2026.pdf` — byte-identical.
+fn sanitize_header_filename(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c == '"' || c == '\\' || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_header_filename;
+
+    #[test]
+    fn plain_and_unicode_names_pass_through() {
+        assert_eq!(sanitize_header_filename("report.pdf"), "report.pdf");
+        assert_eq!(
+            sanitize_header_filename("Relazione 2026.pdf"),
+            "Relazione 2026.pdf"
+        );
+    }
+
+    #[test]
+    fn quotes_backslashes_and_crlf_become_underscores() {
+        assert_eq!(sanitize_header_filename("evil\".pdf"), "evil_.pdf");
+        assert_eq!(sanitize_header_filename("a\\b.pdf"), "a_b.pdf");
+        assert_eq!(
+            sanitize_header_filename("a\r\nX-Evil-1.pdf"),
+            "a__X-Evil-1.pdf"
+        );
+    }
+
+    #[test]
+    fn result_is_header_safe() {
+        for hostile in [
+            "x\".pdf",
+            "x\\.pdf",
+            "x\r.pdf",
+            "x\n.pdf",
+            "x\u{0}.pdf",
+            "x\u{7f}.pdf",
+        ] {
+            let clean = sanitize_header_filename(hostile);
+            assert!(
+                !clean.contains(['"', '\\', '\r', '\n']) && !clean.chars().any(|c| c.is_control()),
+                "unsafe output {clean:?} for input {hostile:?}"
+            );
+        }
+    }
 }
