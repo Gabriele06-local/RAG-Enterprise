@@ -153,7 +153,12 @@ pub async fn run_with_extensions(
     tracing::info!(path = %settings.database.url, "database SQLite");
     let db = db::connect(&settings.database.url).await?;
     db::migrate(&db).await?;
-    db::users::seed_admin(&db, settings.auth.admin_default_password.as_deref()).await?;
+    db::users::seed_admin(
+        &db,
+        settings.auth.admin_default_password.as_deref(),
+        settings.auth.admin_reset_password.as_deref(),
+    )
+    .await?;
 
     let qdrant = clients::qdrant_store::QdrantStore::new(
         &settings.qdrant.grpc_url,

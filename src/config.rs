@@ -51,7 +51,13 @@ pub struct AuthSettings {
     pub jwt_secret: String,
     #[serde(default = "default_jwt_expiry")]
     pub jwt_expiry_minutes: u64,
+    /// Seeds the admin password on a FRESH installation only. Ignored, with a
+    /// warning, once the admin account exists — see db::users::seed_admin.
     pub admin_default_password: Option<String>,
+    /// Overwrites the admin password at startup, deliberately. The escape
+    /// hatch for being locked out; unset it once used.
+    #[serde(default)]
+    pub admin_reset_password: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -663,6 +669,7 @@ mod tests {
             jwt_secret: secret.to_owned(),
             jwt_expiry_minutes: expiry_minutes,
             admin_default_password: None,
+            admin_reset_password: None,
         }
     }
 

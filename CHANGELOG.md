@@ -78,6 +78,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- **A token's claims are now re-checked against the database on every
+  request.** The role and identity were taken from the JWT and believed as
+  written, so deactivating a user, demoting an administrator, or changing a
+  leaked password had *no effect* until the token expired on its own —
+  eight hours, by default. The role is now read from the row, and the
+  lookup already filters `is_active = 1`, so a deactivated account stops
+  working on its next request. Costs one SQLite primary-key lookup per
+  authenticated request. Tokens issued before a password change still
+  survive until expiry; closing that needs a token-version column and is
+  left for its own change.
+
+- **`AUTH__ADMIN_DEFAULT_PASSWORD` no longer overwrites an existing admin
+  password on every start.** It rewrote the stored hash at *every* startup,
+  which meant an installation carrying that variable could never really
+  change its admin password — the value in `.env` silently won again at the
+  next restart, even after the admin had set a new one from the UI. And
+  because the only check was "not empty", `=x` produced a one-character
+  administrator, reinstated at every boot. It now seeds a fresh install
+  only, is validated against the ordinary password policy, and is ignored
+  with a warning once the account exists.
+
+  **Upgrading:** if you relied on that variable to reset the password, use
+  the new `AUTH__ADMIN_RESET_PASSWORD` — it does the same thing on purpose,
+  says so loudly in the log, and should be unset again afterwards.
+
 - **The API no longer answers cross-origin requests from anywhere.** It
   attached `CorsLayer::permissive()` — `Access-Control-Allow-Origin: *`
   with every method and header — to a binary that serves its own frontend
