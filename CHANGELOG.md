@@ -78,6 +78,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- **The API no longer answers cross-origin requests from anywhere.** It
+  attached `CorsLayer::permissive()` — `Access-Control-Allow-Origin: *`
+  with every method and header — to a binary that serves its own frontend
+  from its own origin, so the layer permitted everything and protected
+  nothing: any page on the internet could call this API from a visitor's
+  browser and read the answers. There is now no CORS layer at all unless
+  `SERVER__CORS_ORIGINS` names the origins to allow, which is only needed
+  for a dev server on another port.
+
+- **Every response now carries security headers.** A Content Security
+  Policy (`script-src 'self'`, `frame-ancestors 'none'`), `nosniff`, and
+  `Referrer-Policy: same-origin` — none of which were set, on a binary
+  whose entire surface is an administrative UI. The policy admits
+  `'unsafe-inline'` for styles alone, because the upload progress bar sets
+  its width through a style attribute; script-src is not relaxed to buy
+  that.
+
+- **Server errors no longer hand their internals to the caller.** A 5xx
+  returned the `anyhow` chain verbatim — filesystem paths, the Qdrant URL,
+  SQL text, the body of an eullm reply — which is free reconnaissance for
+  anyone who can provoke one. The detail now goes to the log, where it is
+  useful, and the response says only that something broke. Client errors
+  are unchanged: a 4xx still explains what the caller got wrong.
+
 - **CI now runs on pull requests, and checks that the committed frontend
   bundle matches its source.** The workflow only triggered on pushes to
   `main`, so an external contributor's code was validated *after* it had

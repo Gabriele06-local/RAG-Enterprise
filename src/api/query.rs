@@ -47,7 +47,17 @@ pub struct QueryRequest {
     pub conversation_id: Option<String>,
 }
 
+/// A 4xx tells the caller what they got wrong, so its message travels.
+/// A 5xx does not: `msg` is an anyhow chain carrying whatever context the
+/// failure picked up on the way out — filesystem paths, the Qdrant URL, SQL
+/// text, the body of an eullm reply — and handing that to an unauthenticated
+/// caller is free reconnaissance. The detail goes to the log, where it is
+/// actually useful, and the response says only that something broke.
 fn err(status: StatusCode, msg: impl std::fmt::Display) -> Response {
+    if status.is_server_error() {
+        tracing::error!(status = %status, detail = %msg, "request failed");
+        return (status, Json(json!({ "error": "internal server error" }))).into_response();
+    }
     (status, Json(json!({ "error": msg.to_string() }))).into_response()
 }
 

@@ -7,11 +7,13 @@ pub mod query;
 
 use axum::{
     extract::DefaultBodyLimit,
+    http::{HeaderName, HeaderValue, Method, header},
     Router,
     routing::{delete, get, post, put},
 };
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
+use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::state::AppState;
 
@@ -88,6 +90,8 @@ pub fn router(state: AppState, pro_router: Option<Router<AppState>>) -> Router {
     // exe-relative, following the same "portable app dir" convention as
     // config::default_data_dir, rather than CWD-relative — otherwise the binary
     // only works when launched from inside the right directory.
+    let cors_origins = crate::config::parse_cors_origins(&state.settings.server.cors_origins);
+
     let dist = frontend_dist_dir();
     let spa = ServeDir::new(&dist).not_found_service(ServeFile::new(dist.join("index.html")));
 
@@ -102,10 +106,94 @@ pub fn router(state: AppState, pro_router: Option<Router<AppState>>) -> Router {
         app = app.merge(pro_router);
     }
 
-    app.layer(CorsLayer::permissive())
-        .with_state(state)
-        .fallback_service(spa)
+    // CORS only when someone asked for it. The previous
+    // `CorsLayer::permissive()` advertised `Access-Control-Allow-Origin: *`
+    // with every method and header, on a binary that serves its own frontend
+    // from its own origin — so it protected nothing and permitted everything,
+    // letting any page on the internet call this API from a visitor's browser
+    // and read the answers. The one legitimate need is a Vite dev server on
+    // another port, which is what SERVER__CORS_ORIGINS is for.
+    let app = match cors_layer(&cors_origins) {
+        Some(layer) => app.layer(layer),
+        None => app,
+    };
+
+    // Response headers for everything this server returns, API and SPA alike.
+    // None of them were set before, on a binary whose whole surface is an
+    // administrative UI. Applied here rather than built in a helper because
+    // a ServiceBuilder's type spells out every layer it holds, and a type
+    // like that breaks the moment a fourth header is added.
+    app.layer(SetResponseHeaderLayer::overriding(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+    ))
+    // Stops a browser second-guessing a declared Content-Type — the classic
+    // way an uploaded file ends up executed as something else.
+    .layer(SetResponseHeaderLayer::overriding(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    ))
+    // Document ids and filenames live in these URLs; they have no reason to
+    // travel to another site in a Referer header.
+    .layer(SetResponseHeaderLayer::overriding(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("same-origin"),
+    ))
+    .with_state(state)
+    .fallback_service(spa)
 }
+
+/// Strict where it counts — `script-src 'self'` means the only runnable code
+/// is the bundle this binary ships, and `frame-ancestors 'none'` keeps the
+/// admin UI out of anyone else's iframe.
+///
+/// `'unsafe-inline'` is admitted for styles alone, because the upload
+/// progress bar sets its width through a style attribute and CSP blocks
+/// those too. A deliberate, narrow concession: style injection is a far
+/// smaller problem than script injection, and nothing here relaxes
+/// script-src to buy it.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; \
+     script-src 'self'; \
+     style-src 'self' 'unsafe-inline'; \
+     img-src 'self' data:; \
+     font-src 'self'; \
+     connect-src 'self'; \
+     object-src 'none'; \
+     base-uri 'self'; \
+     form-action 'self'; \
+     frame-ancestors 'none'";
+
+/// Builds a CORS layer restricted to `origins`, or `None` when the list is
+/// empty — in which case the router attaches no CORS layer at all, and the
+/// browser's own same-origin policy is left to do its job undisturbed.
+///
+/// Deliberately narrow where `permissive()` was not: only the methods this
+/// API actually answers, and only the two headers a browser client needs to
+/// send. Credentials stay off, because authentication here is a Bearer token
+/// the client attaches explicitly, never a cookie the browser would attach
+/// on its own.
+fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
+    let parsed: Vec<HeaderValue> = origins
+        .iter()
+        .filter_map(|o| match o.parse::<HeaderValue>() {
+            Ok(v) => Some(v),
+            Err(_) => {
+                tracing::warn!(origin = %o, "SERVER__CORS_ORIGINS: ignoring unusable origin");
+                None
+            }
+        })
+        .collect();
+    if parsed.is_empty() {
+        return None;
+    }
+    Some(
+        CorsLayer::new()
+            .allow_origin(parsed)
+            .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
+    )
+}
+
 
 #[cfg(test)]
 mod tests {
