@@ -6,6 +6,7 @@ use sqlx::SqlitePool;
 use crate::bench::LiveRecorder;
 use crate::clients::embeddings::EmbeddingService;
 use crate::clients::eullm::EullmClient;
+use crate::auth::throttle::LoginThrottle;
 use crate::config::Settings;
 use crate::documents::storage::FileStorage;
 use crate::extensions::ExtensionRegistry;
@@ -52,6 +53,11 @@ pub struct AppState {
     /// crate — see extensions::ExtensionRegistry. Always
     /// ExtensionRegistry::default() in the Community binary itself.
     pub extensions: Arc<ExtensionRegistry>,
+    /// Guards POST /api/auth/login, the one endpoint that does expensive work
+    /// (an Argon2 verification) before knowing who is calling — see
+    /// auth::throttle for why it throttles by username and total concurrency
+    /// rather than by client IP.
+    pub login_throttle: Arc<LoginThrottle>,
 }
 
 /// RAII guard: increments active_ingestions on creation and ALWAYS decrements
@@ -93,6 +99,7 @@ impl AppState {
             active_ingestions: Arc::new(AtomicUsize::new(0)),
             live_bench,
             extensions: Arc::new(extensions),
+            login_throttle: Arc::new(LoginThrottle::new()),
         }
     }
 

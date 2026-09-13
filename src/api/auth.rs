@@ -65,13 +65,49 @@ pub async fn login(
     State(state): State<AppState>,
     Json(body): Json<LoginRequest>,
 ) -> impl IntoResponse {
+    // Progressive delay for an account that keeps failing — see auth::throttle
+    // for the whole design, including why none of this looks at the client's
+    // IP. Applied before the lookup and keyed on the name exactly as
+    // submitted, so that spraying usernames is counted too and the throttle
+    // itself never reveals which accounts exist.
+    let delay = state.login_throttle.delay_for(&body.username);
+    if !delay.is_zero() {
+        tracing::warn!(
+            username = %body.username,
+            delay_ms = delay.as_millis() as u64,
+            "login throttled after repeated failures"
+        );
+        tokio::time::sleep(delay).await;
+    }
+
+    // Bounded concurrency around the Argon2 verification below. Refusing here
+    // costs nothing, which is the point: without it every attempt buys a hash,
+    // and the cost of rejecting an attack would scale with the attack. The
+    // permit is released on Drop, so every early return below frees its slot.
+    let _verification_slot = match state.login_throttle.try_begin_verification() {
+        Some(permit) => permit,
+        None => {
+            tracing::warn!(
+                username = %body.username,
+                "login refused: all password-verification slots busy"
+            );
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"error": "too many login attempts in flight, try again shortly"})),
+            )
+                .into_response();
+        }
+    };
+
     let user = match users::find_by_username(&state.db, &body.username).await {
         Ok(Some(u)) => u,
         Ok(None) => {
+            state.login_throttle.record_failure(&body.username);
             return (StatusCode::UNAUTHORIZED, Json(json!({"error": "invalid credentials"})))
                 .into_response();
         }
         Err(e) => {
+            // Our fault, not the caller's: do not count it against them.
             tracing::error!("db error in login: {e:#}");
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "internal error"})))
                 .into_response();
@@ -81,10 +117,13 @@ pub async fn login(
     match password::verify(&body.password, &user.password_hash) {
         Ok(true) => {}
         _ => {
+            state.login_throttle.record_failure(&body.username);
             return (StatusCode::UNAUTHORIZED, Json(json!({"error": "invalid credentials"})))
                 .into_response();
         }
     }
+
+    state.login_throttle.record_success(&body.username);
 
     if let Err(e) = users::touch_last_login(&state.db, user.id).await {
         tracing::warn!("touch_last_login failed: {e:#}");

@@ -242,6 +242,10 @@ cargo build --release --features cuda
   hardware.
 - **Verified components.** Every downloaded component is checked against a
   sha256 pinned in `manifest.toml`; a mismatch aborts the run.
+- **Throttled logins.** Repeated failures against one account earn a growing
+  delay, and only a few password verifications ever run at once — the rest get
+  a `429` without costing a hash. Scripted clients should expect both:
+  a login can take a few seconds, or come back `429` and be worth retrying.
 
 Please report vulnerabilities privately rather than through a public issue.
 

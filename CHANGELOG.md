@@ -78,6 +78,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- **Repeated failed logins against one account now earn a growing delay,
+  and only a few password verifications run at once.**
+  `POST /api/auth/login` accepted unlimited attempts and paid an Argon2id
+  verification for each one, which made two things cheap that should not
+  be: brute-forcing `admin` — an account that exists on every install,
+  under a name everyone knows — and saturating the CPU that also has to
+  serve the language model, without any credentials at all.
+
+  After three free failures a username's next attempt waits one second,
+  then two, four, and so on up to thirty. It is a delay and not a lockout
+  on purpose: a lockout would let anyone deny an account to its owner just
+  by failing against it. A successful login clears the count, and one
+  account's failures never delay another's.
+
+  Independently, at most four verifications run concurrently; anything
+  past that is refused with `429` *before* hashing, so the cost of
+  rejecting an attack does not scale with the attack.
+
+  Neither mechanism reads the client's IP, deliberately — behind the
+  reverse proxy this README now recommends, every request shares one
+  address, and a per-IP limit would let one person's typo lock out an
+  entire organisation. See the module documentation in
+  `src/auth/throttle.rs` for the full reasoning.
+
 - **`h2` updated to 0.4.19** (RUSTSEC-2026-0258: unbounded empty DATA
   frames). It reaches this server through hyper under axum, and axum 0.7
   accepts cleartext HTTP/2 with prior knowledge, so the denial of service
