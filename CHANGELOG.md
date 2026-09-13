@@ -17,12 +17,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+ fix/download-header-sanitization
+- **Downloaded filenames are sanitised for the `Content-Disposition`
+  header.** The stored filename comes verbatim from the multipart body
+  while `storage::path_for` only neutralises path traversal, so a name
+  containing `"`, `\` or CR/LF reached the header uninterpolated —
+  breaking out of the quoted string at best, response splitting at
+  worst. Quotes, backslashes and ASCII controls now become `_`;
+  legitimate names (including non-ASCII ones) are untouched.
+=======
 - **The user-management stubs no longer answer non-admin callers.**
   `GET /api/auth/users` returned `200` to any authenticated role, and the
   other stubs had no role check at all — whatever gets built on them later
   would have inherited the hole. All four now require the admin role
   (`403` otherwise), mirroring `api::admin::require_admin`, via the
   previously-dead `Role::can_manage_users` helper.
+
 
 - **A single malformed SSE line no longer discards a whole streaming
   answer.** `JSON.parse` on a `data:` line ran unguarded inside the
