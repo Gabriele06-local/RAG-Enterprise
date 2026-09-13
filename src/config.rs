@@ -376,7 +376,12 @@ impl Default for DataSettings {
     }
 }
 
-fn default_host() -> String { "0.0.0.0".into() }
+/// Loopback, NOT 0.0.0.0. This binary serves an admin UI over plain HTTP with
+/// no TLS: on 0.0.0.0 every machine on the network could reach it, and the
+/// login password and Bearer tokens travelled in clear text — while the README
+/// told the user the app lives at localhost. Exposing it is now opt-in, and
+/// `host_is_loopback` makes the server warn when it is opted into.
+fn default_host() -> String { "127.0.0.1".into() }
 fn default_port() -> u16 { 8000 }
 fn default_db_url() -> String { "sqlite://rag_users.db".into() }
 fn default_jwt_expiry() -> u64 { 480 }
@@ -482,6 +487,28 @@ fn validate_auth(auth: &AuthSettings) -> Result<()> {
         anyhow::bail!("AUTH__JWT_EXPIRY_MINUTES is too large: its value in seconds overflows u64.");
     }
     Ok(())
+}
+
+/// True when `SERVER__HOST` keeps the server reachable only from this machine.
+///
+/// Used by `lib::run_with_extensions` to warn at startup when it is false: this
+/// binary speaks plain HTTP with no TLS anywhere in the codebase, so binding
+/// anything but loopback puts the login password and every Bearer token on the
+/// wire in clear text. `default_host` is loopback for that reason; exposing the
+/// server is a deliberate act that deserves a deliberate warning.
+///
+/// A free function so it can be tested without touching real environment
+/// variables, like `validate_auth` above. Accepts the literal "localhost" as
+/// well as a parsed address, since both are valid in `SERVER__HOST`; anything
+/// that is not a recognisable address at all (a DNS name) is treated as NOT
+/// loopback, which errs toward warning rather than staying silent.
+pub(crate) fn host_is_loopback(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 /// Extracted from Settings::load so it can be tested without touching real
@@ -639,5 +666,33 @@ mod tests {
     fn overflowing_expiry_fails() {
         let err = validate_auth(&auth_with(&"s".repeat(32), u64::MAX)).unwrap_err();
         assert!(err.to_string().contains("AUTH__JWT_EXPIRY_MINUTES"));
+    }
+
+    /// The default must stay loopback: a regression here silently re-exposes
+    /// an unencrypted admin UI to the whole network, which is exactly the
+    /// state this default was changed away from.
+    #[test]
+    fn default_host_is_loopback() {
+        assert!(
+            host_is_loopback(&default_host()),
+            "default_host() must not expose the server beyond this machine, got {:?}",
+            default_host()
+        );
+    }
+
+    #[test]
+    fn loopback_hosts_are_recognised() {
+        for host in ["127.0.0.1", "::1", "localhost", "LOCALHOST", "127.3.2.1"] {
+            assert!(host_is_loopback(host), "host={host:?}");
+        }
+    }
+
+    #[test]
+    fn routable_and_unparseable_hosts_are_not_loopback() {
+        // A DNS name is not resolved here: unrecognisable means "warn", never
+        // "stay silent".
+        for host in ["0.0.0.0", "::", "192.168.1.10", "10.0.0.1", "rag.example.com", ""] {
+            assert!(!host_is_loopback(host), "host={host:?}");
+        }
     }
 }

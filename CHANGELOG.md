@@ -15,9 +15,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **The server now listens on `127.0.0.1` by default instead of
+  `0.0.0.0`.** This binary serves its admin UI over plain HTTP and
+  terminates no TLS anywhere, so the previous default put the login
+  password and every session token on the wire in clear text, readable by
+  anyone on the same network — while the quick start told the user the app
+  lives at `localhost`. It is now reachable only from the machine it runs
+  on unless `SERVER__HOST` says otherwise, and when it does say otherwise
+  the server logs a warning at startup explaining what that costs. See
+  "Reaching it from another machine" in the README for the reverse-proxy
+  setup this replaces it with.
+
+  **Upgrading:** an installation that was being reached from other
+  machines will stop answering them until `SERVER__HOST=0.0.0.0` is set
+  explicitly — preferably behind a proxy that terminates TLS.
+
+### Removed
+
+- **Five declared dependencies that no code referenced** — `quick-xml`,
+  `validator`, `pulldown-cmark`, `walkdir` and `zstd`. Beyond build time,
+  two of them were pulling known-vulnerable crates into the tree for
+  nothing: dropping `validator` removes `idna 0.5.0` (RUSTSEC-2024-0421)
+  entirely, and dropping the direct `quick-xml` removes one of the four
+  copies flagged by RUSTSEC-2026-0194/0195.
+
 ### Fixed
 
- fix/download-header-sanitization
 - **Downloaded filenames are sanitised for the `Content-Disposition`
   header.** The stored filename comes verbatim from the multipart body
   while `storage::path_for` only neutralises path traversal, so a name
@@ -25,7 +50,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   breaking out of the quoted string at best, response splitting at
   worst. Quotes, backslashes and ASCII controls now become `_`;
   legitimate names (including non-ASCII ones) are untouched.
-=======
+
 - **The user-management stubs no longer answer non-admin callers.**
   `GET /api/auth/users` returned `200` to any authenticated role, and the
   other stubs had no role check at all — whatever gets built on them later
@@ -50,6 +75,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Argon2. The endpoint now rejects passwords shorter than 6 or longer
   than 128 characters with a 400, enforced by a tested
   `auth::password::validate_new_password`.
+
+### Security
+
+- **`h2` updated to 0.4.19** (RUSTSEC-2026-0258: unbounded empty DATA
+  frames). It reaches this server through hyper under axum, and axum 0.7
+  accepts cleartext HTTP/2 with prior knowledge, so the denial of service
+  was reachable before any authentication ran. A patch bump; no code
+  changed.
 
 ---
 
