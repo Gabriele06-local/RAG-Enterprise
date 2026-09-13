@@ -192,6 +192,20 @@ pub async fn run_with_extensions(
         .with_context(|| format!("bind {addr}"))?;
     tracing::info!("server listening on {addr}");
 
+    // Nothing in this binary terminates TLS, so a non-loopback bind means the
+    // login password and every Bearer token cross the network in clear text.
+    // That can be a perfectly deliberate setup — behind a TLS-terminating
+    // reverse proxy it is the normal one — so this warns rather than refuses;
+    // it exists so the choice is never made by accident.
+    if !config::host_is_loopback(&host) {
+        tracing::warn!(
+            host = %host,
+            "SERVER__HOST is not loopback: this server speaks plain HTTP, so passwords \
+             and session tokens travel unencrypted. Put a TLS-terminating reverse proxy \
+             in front of it, or set SERVER__HOST=127.0.0.1 to keep it on this machine."
+        );
+    }
+
     open_browser(port);
 
     let router = api::router(app_state, pro_router);

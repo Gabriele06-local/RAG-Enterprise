@@ -151,6 +151,8 @@ AUTH__JWT_SECRET=…            # required — signs the session tokens
 Everything else is optional:
 
 ```sh
+SERVER__HOST=127.0.0.1           # loopback by default — see "Reaching it from
+                                 # another machine" below before changing it
 SERVER__PORT=8000
 AUTH__ADMIN_DEFAULT_PASSWORD=…   # otherwise a random one is generated and logged
 EULLM__MODEL=qwen3-14b           # only read when you run eullm yourself; when
@@ -167,6 +169,30 @@ RUST_LOG=info
 setup degrades to CPU and ingestion goes from seconds to minutes, which is easy
 not to notice. The fallback is always logged at error level and exposed on
 `GET /api/info`.
+
+### Reaching it from another machine
+
+`SERVER__HOST` defaults to `127.0.0.1`, so out of the box the engine answers
+only on the machine it runs on — which is what the quick start above describes.
+
+Setting it to `0.0.0.0` makes it reachable from the network, and there is one
+thing to understand before doing that: **this binary serves plain HTTP and
+terminates no TLS.** On a routable address the login password and every
+session token that follows cross the network in clear text, readable by anyone
+who can see the traffic. The server logs a warning at startup whenever
+`SERVER__HOST` is not a loopback address, for exactly this reason.
+
+So expose it behind something that terminates TLS. With Caddy that is a whole
+configuration file:
+
+```
+rag.example.com {
+    reverse_proxy 127.0.0.1:8000
+}
+```
+
+Leave `SERVER__HOST` at `127.0.0.1` in that setup: the proxy reaches the engine
+over loopback, and nothing but the proxy can reach it directly.
 
 ## Measuring performance
 

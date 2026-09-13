@@ -294,7 +294,7 @@ Configuration keys use `__` (double underscore) to separate hierarchy levels,
 and can be set through the environment or a `.env` file:
 
 ```sh
-SERVER__HOST=0.0.0.0
+SERVER__HOST=127.0.0.1   # loopback by default; see the README before exposing
 SERVER__PORT=8000
 DATABASE__URL=sqlite://rag_users.db
 AUTH__JWT_SECRET=change_this_secret
