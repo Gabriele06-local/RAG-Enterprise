@@ -126,11 +126,9 @@ name: CI
 # sospetta che main sia rimasto indietro.
 
 on:
-  # SOLO push diretto su main — niente pull_request: anche se il target di
-  # una PR è main, GitHub etichetta comunque quel run col branch sorgente
-  # (es. "dev-cihrdj"), quindi ogni merge produceva 2 run (uno per la PR, uno
-  # per il push post-merge) — doppio consumo di minuti per lo stesso set di
-  # modifiche. Ora: un run solo, quando main cambia davvero.
+  # push: SOLO su main (piu' i tag). I branch di lavoro non fanno scattare
+  # nulla da soli: ci pensa la loro PR, sotto. Cosi' un merge produce un run
+  # solo — quello del push su main — invece di due.
   #
   # tags: i tag di release (v0.1.0…) sono un ref a parte (refs/tags, non
   # refs/heads) — push:branches non li intercetta affatto, serve elencarli
@@ -140,8 +138,23 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+
+  # pull_request: perche' senza, il codice di un contributore esterno finiva
+  # su main senza essere MAI stato compilato — la validazione arrivava dopo
+  # il merge, cioe' troppo tardi. Con i fork GitHub chiede comunque
+  # l'approvazione manuale del primo run di ogni nuovo contributore: e'
+  # giusto che sia cosi' e non va aggirato.
+  #
+  # Nessun doppio run: i branch di lavoro non sono in push:branches, quindi
+  # un push su un branch con PR aperta fa scattare solo il run della PR.
+  pull_request:
+    branches: [main]
+
   workflow_dispatch: {} # trigger manuale, utile anche solo per riverificare
 
+# github.ref distingue gia' una PR (refs/pull/N/merge) da main, quindi PR
+# diverse non si cancellano a vicenda; un nuovo push sulla stessa PR invece
+# si', che e' quello che si vuole.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -200,6 +213,21 @@ jobs:
 
       - run: npm ci
       - run: npm run build
+
+      # frontend/dist e' committato nel repository (lo serve ServeDir da un
+      # checkout, vedi api::mod::frontend_dist_dir), quindi puo' divergere dal
+      # sorgente senza che nessuno se ne accorga. Peggio: una PR esterna porta
+      # con se' un bundle minificato costruito su una macchina altrui, che
+      # nessuno puo' rileggere a occhio. Questo step lo ricostruisce e fallisce
+      # se non combacia — l'unica verifica che rende quel file affidabile.
+      - name: Il bundle committato corrisponde al sorgente?
+        working-directory: .
+        run: |
+          if ! git diff --exit-code --stat -- frontend/dist; then
+            echo "::error::frontend/dist non corrisponde a frontend/src." \
+                 "Esegui 'npm ci && npm run build' in frontend/ e committa il risultato."
+            exit 1
+          fi
 
   # ─────────────────────────────────────────────────────────────────────────
   # Cache warm-up (solo su push a main, solo se cambiano le dipendenze) — vedi

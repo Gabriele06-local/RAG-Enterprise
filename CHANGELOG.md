@@ -78,6 +78,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- **CI now runs on pull requests, and checks that the committed frontend
+  bundle matches its source.** The workflow only triggered on pushes to
+  `main`, so an external contributor's code was validated *after* it had
+  already landed — the wrong order, and one that only worked this month
+  because every such pull request was compiled and tested by hand. The
+  bundle check exists for the same reason: `frontend/dist` is committed,
+  so a pull request carries a minified file built on someone else's
+  machine that nobody can review by reading it. CI rebuilds it and fails
+  on any difference. First-time contributors from a fork still need a
+  maintainer to approve the run, which is the correct default and is left
+  alone.
+
 - **Repeated failed logins against one account now earn a growing delay,
   and only a few password verifications run at once.**
   `POST /api/auth/login` accepted unlimited attempts and paid an Argon2id
