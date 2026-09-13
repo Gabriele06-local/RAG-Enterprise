@@ -21,9 +21,6 @@ impl Role {
         matches!(self, Role::Admin | Role::SuperUser)
     }
 
-    // Used once the user-management endpoints in api/auth.rs stop being
-    // stubs. While they are, this is legitimately never called.
-    #[allow(dead_code)]
     pub fn can_manage_users(self) -> bool {
         matches!(self, Role::Admin)
     }
@@ -49,5 +46,32 @@ impl FromStr for Role {
             "user" => Ok(Role::User),
             other => Err(anyhow::anyhow!("unknown role: {other}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_admin_manages_users() {
+        assert!(Role::Admin.can_manage_users());
+        assert!(!Role::SuperUser.can_manage_users());
+        assert!(!Role::User.can_manage_users());
+    }
+
+    #[test]
+    fn upload_and_delete_need_elevation() {
+        assert!(Role::Admin.can_upload() && Role::Admin.can_delete());
+        assert!(Role::SuperUser.can_upload() && Role::SuperUser.can_delete());
+        assert!(!Role::User.can_upload() && !Role::User.can_delete());
+    }
+
+    #[test]
+    fn display_fromstr_roundtrip() {
+        for role in [Role::Admin, Role::SuperUser, Role::User] {
+            assert_eq!(role.to_string().parse::<Role>().unwrap(), role);
+        }
+        assert!("owner".parse::<Role>().is_err());
     }
 }
