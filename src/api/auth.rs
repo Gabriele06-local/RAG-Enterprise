@@ -201,27 +201,56 @@ pub async fn change_password(
 
 // ── Admin-only stubs ──────────────────────────────────────────────────────────
 
-pub async fn list_users(
-    _state: State<AppState>,
-    _claims: Claims,
-) -> impl IntoResponse {
-    Json(json!({"users": [], "total": 0}))
+// Fail closed while the real user management is unimplemented: without this,
+// any authenticated role (including plain `user`) gets a 200 from list_users
+// today, and whatever gets built on these stubs later inherits the same
+// hole. Mirrors api::admin::require_admin's "admin role required" contract.
+fn require_admin(claims: &Claims) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    if !claims.role.can_manage_users() {
+        Some((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "admin role required"})),
+        ))
+    } else {
+        None
+    }
+}
+
+pub async fn list_users(_state: State<AppState>, claims: Claims) -> impl IntoResponse {
+    if let Some(r) = require_admin(&claims) {
+        return r.into_response();
+    }
+    Json(json!({"users": [], "total": 0})).into_response()
 }
 
 pub async fn create_user(
     _state: State<AppState>,
-    _claims: Claims,
+    claims: Claims,
     Json(_body): Json<UserCreateRequest>,
 ) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "not implemented"})))
+    if let Some(r) = require_admin(&claims) {
+        return r.into_response();
+    }
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({"error": "not implemented"})),
+    )
+        .into_response()
 }
 
 pub async fn update_user(
     _state: State<AppState>,
-    _claims: Claims,
+    claims: Claims,
     Path(_user_id): Path<i64>,
 ) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "not implemented"})))
+    if let Some(r) = require_admin(&claims) {
+        return r.into_response();
+    }
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({"error": "not implemented"})),
+    )
+        .into_response()
 }
 
 pub async fn delete_user(
@@ -229,6 +258,9 @@ pub async fn delete_user(
     claims: Claims,
     Path(user_id): Path<i64>,
 ) -> impl IntoResponse {
+    if let Some(r) = require_admin(&claims) {
+        return r.into_response();
+    }
     if user_id == claims.user_id {
         return (
             StatusCode::BAD_REQUEST,
@@ -236,5 +268,9 @@ pub async fn delete_user(
         )
             .into_response();
     }
-    (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": "not implemented"}))).into_response()
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({"error": "not implemented"})),
+    )
+        .into_response()
 }

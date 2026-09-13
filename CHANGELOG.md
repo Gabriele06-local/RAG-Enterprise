@@ -17,6 +17,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The user-management stubs no longer answer non-admin callers.**
+  `GET /api/auth/users` returned `200` to any authenticated role, and the
+  other stubs had no role check at all — whatever gets built on them later
+  would have inherited the hole. All four now require the admin role
+  (`403` otherwise), mirroring `api::admin::require_admin`, via the
+  previously-dead `Role::can_manage_users` helper.
+
 - **A single malformed SSE line no longer discards a whole streaming
   answer.** `JSON.parse` on a `data:` line ran unguarded inside the
   stream loop, so one truncated chunk (flaky network) threw into the
