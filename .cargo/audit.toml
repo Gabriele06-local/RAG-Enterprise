@@ -1,0 +1,18 @@
+# cargo-audit configuration.
+#
+# Only for advisories that have been looked at and found not to apply. An
+# entry here is a claim someone has to be able to defend, so each one says
+# why.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — Marvin attack on `rsa`, no fixed version available.
+    #
+    # It reaches Cargo.lock through sqlx's MySQL driver, which this project
+    # does not build: the sqlx features enabled in Cargo.toml are sqlite and
+    # postgres. `cargo tree -i rsa` finds nothing in the compiled graph, so
+    # the crate is listed in the lockfile but never linked into the binary.
+    #
+    # Revisit if a MySQL backend is ever enabled, or if a fixed rsa ships.
+    "RUSTSEC-2023-0071",
+]

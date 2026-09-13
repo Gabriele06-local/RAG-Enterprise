@@ -184,6 +184,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   entire organisation. See the module documentation in
   `src/auth/throttle.rs` for the full reasoning.
 
+- **`cargo audit` is clean: twelve advisories down to zero.** The remaining
+  `quick-xml` copies went with `docx-rs` 0.4.22, `pdf_oxide` 0.3.77 and
+  `calamine` 0.36.1, all of which now use the patched 0.41 — closing
+  RUSTSEC-2026-0194 and RUSTSEC-2026-0195, the quadratic-parse and
+  unbounded-allocation flaws reachable through any DOCX or XLSX a user
+  uploads. `crossbeam-epoch` went to 0.9.21 (RUSTSEC-2026-0204).
+
+  What is left is `rsa` (RUSTSEC-2023-0071, no fix published), which
+  reaches the lockfile through sqlx's MySQL driver — a backend this project
+  does not build, so the crate is never linked into the binary.
+  `.cargo/audit.toml` records that with the reasoning, rather than leaving
+  a permanent red line nobody reads. Seven "unmaintained" advisories remain
+  on transitive crates; none has an action.
+
 - **`h2` updated to 0.4.19** (RUSTSEC-2026-0258: unbounded empty DATA
   frames). It reaches this server through hyper under axum, and axum 0.7
   accepts cleartext HTTP/2 with prior knowledge, so the denial of service
