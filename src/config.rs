@@ -303,6 +303,15 @@ pub struct StorageSettings {
     pub max_upload_mb: u64,
 }
 
+impl StorageSettings {
+    /// Byte cap for one upload body. `validate_storage` guarantees
+    /// `max_upload_mb <= MAX_UPLOAD_MB`, so this multiplication cannot
+    /// overflow in any accepted configuration.
+    pub fn max_upload_bytes(&self) -> u64 {
+        self.max_upload_mb * 1024 * 1024
+    }
+}
+
 /// Provisional ceiling for `STORAGE__MAX_UPLOAD_MB` (see `validate_storage`).
 /// Deliberately provisional: while upload bodies are buffered in RAM this
 /// limit doubles as memory protection, so it stays conservative; once

@@ -11,8 +11,10 @@ use axum::{
     Json,
 };
 use chrono::Utc;
+use futures_util::StreamExt;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 
 use crate::auth::jwt::Claims;
 use crate::bench;
@@ -126,21 +128,56 @@ async fn swap_embeddings_blocking(state: &AppState, to_gpu: bool) -> anyhow::Res
 }
 
 async fn process_upload(state: &AppState, mut multipart: Multipart) -> Response {
-    // 1. Read file bytes from multipart field "file"
+    // 1. Stream the "file" field straight to a temp file, hashing
+    // incrementally and rejecting as soon as the configured cap is
+    // exceeded — the body is never held in RAM (issue #43). The
+    // `DefaultBodyLimit` in api::router stays as a backstop behind this
+    // early rejection.
+    let max_bytes = state.settings.storage.max_upload_bytes();
     let mut filename = String::new();
-    let mut file_bytes: Vec<u8> = Vec::new();
+    let mut ext = String::new();
+    let mut received: Option<(u64, String)> = None;
+    let mut tmp_path = std::path::PathBuf::new();
 
     loop {
         match multipart.next_field().await {
             Ok(Some(field)) => {
                 if field.name().unwrap_or("") == "file" {
                     filename = field.file_name().unwrap_or("upload").to_string();
-                    match field.bytes().await {
-                        Ok(b) => {
-                            file_bytes = b.to_vec();
+                    // The parser dispatches on extension, so the temp file
+                    // keeps it (unchanged behaviour, just computed earlier).
+                    ext = std::path::Path::new(&filename)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+                    tmp_path = std::env::temp_dir().join(format!("{}.{ext}", uuid::Uuid::new_v4()));
+                    futures_util::pin_mut!(field);
+                    match stream_upload_to_file(field, &tmp_path, max_bytes).await {
+                        Ok((len, sha)) => {
+                            if len == 0 {
+                                let _ = tokio::fs::remove_file(&tmp_path).await;
+                                return err(
+                                    StatusCode::BAD_REQUEST,
+                                    "no file in multipart request (field name: \"file\")",
+                                );
+                            }
+                            received = Some((len, sha));
                             break;
                         }
-                        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+                        Err(ReceiveError::TooLarge) => {
+                            return err(
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                format!(
+                                    "upload exceeds the {} MB limit",
+                                    state.settings.storage.max_upload_mb
+                                ),
+                            );
+                        }
+                        Err(ReceiveError::Read(e)) => return err(StatusCode::BAD_REQUEST, e),
+                        Err(ReceiveError::Write(e)) => {
+                            return err(StatusCode::INTERNAL_SERVER_ERROR, e)
+                        }
                     }
                 }
             }
@@ -149,46 +186,32 @@ async fn process_upload(state: &AppState, mut multipart: Multipart) -> Response 
         }
     }
 
-    if file_bytes.is_empty() {
-        return err(StatusCode::BAD_REQUEST, "no file in multipart request (field name: \"file\")");
-    }
+    let Some((_, content_sha256)) = received else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "no file in multipart request (field name: \"file\")",
+        );
+    };
+    // From here on the temp file exists: own it till the end of the
+    // function, so every early return below removes it (the receive step
+    // already removed its own partials on the paths above).
+    let _tmp_guard = RemoveOnDrop(tmp_path.clone());
 
     // Content identity for provenance_id (see rag::chunker::provenance_id):
     // anchored to the uploaded bytes, NOT to document_id below (a fresh UUID
     // every upload) — re-ingesting this same file must yield the same hash,
     // and therefore the same provenance_id per chunk, given an unchanged
-    // chunking configuration.
-    let content_sha256 = {
-        let mut hasher = Sha256::new();
-        hasher.update(&file_bytes);
-        format!("{:x}", hasher.finalize())
-    };
+    // chunking configuration. The digest is computed incrementally during
+    // reception above, so it is identical to a one-shot hash of the body.
 
-    // 2. Write to a named temp file preserving the extension (parser dispatches by ext)
-    let ext = std::path::Path::new(&filename)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-
-    let tmp_path = std::env::temp_dir().join(format!("{}.{ext}", uuid::Uuid::new_v4()));
-
-    if let Err(e) = std::fs::write(&tmp_path, &file_bytes) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("write temp: {e}"));
-    }
-
-    // 3. Extract text (sync, possibly heavy — run off the async executor).
+    // 2. Extract text (sync, possibly heavy — run off the async executor).
     // Timed even when --bench-live is off: an Instant::now() costs nothing
     // worth conditionalising.
     let extract_start = std::time::Instant::now();
     let extracted = match tokio::task::spawn_blocking({
         let tmp = tmp_path.clone();
         let data_dir = state.settings.data.data_path();
-        move || {
-            let r = parser::extract_text(&tmp, &data_dir);
-            let _ = std::fs::remove_file(&tmp);
-            r
-        }
+        move || parser::extract_text(&tmp, &data_dir)
     })
     .await
     {
@@ -199,7 +222,7 @@ async fn process_upload(state: &AppState, mut multipart: Multipart) -> Response 
     let extract_time = extract_start.elapsed();
     let parser::ExtractedText { text, page_count, pages } = extracted;
 
-    // 4. Chunk
+    // 3. Chunk
     let chunk_start = std::time::Instant::now();
     let chunks = chunker::split_text(&text);
     let chunk_time = chunk_start.elapsed();
@@ -210,7 +233,7 @@ async fn process_upload(state: &AppState, mut multipart: Multipart) -> Response 
         );
     }
 
-    // 4b. Enrich each chunk before it is embedded/stored — Community's own
+    // 3b. Enrich each chunk before it is embedded/stored — Community's own
     // default prepends the nearest preceding structural heading ("Article
     // 99", "Chapter XII", ...) to any chunk that doesn't already start with
     // it (see extensions::ingestion::DefaultChunkEnricher, wrapping
@@ -225,7 +248,7 @@ async fn process_upload(state: &AppState, mut multipart: Multipart) -> Response 
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("chunk enrichment: {e}")),
     };
 
-    // 5. Embed. Candle is CPU/GPU-bound (spawn_blocking); eullm is an HTTP
+    // 4. Embed. Candle is CPU/GPU-bound (spawn_blocking); eullm is an HTTP
     // call (.await directly) — see config::IngestionEmbedding::Eullm.
     let embed_start = std::time::Instant::now();
     let embeddings = if state.settings.embeddings.ingestion_embedding
@@ -263,7 +286,7 @@ async fn process_upload(state: &AppState, mut multipart: Multipart) -> Response 
     };
     let embed_time = embed_start.elapsed();
 
-    // 6. Build Qdrant payloads and upsert
+    // 5. Build Qdrant payloads and upsert
     let document_id = uuid::Uuid::new_v4().to_string();
     let upload_date = Utc::now().to_rfc3339();
 
@@ -327,7 +350,7 @@ async fn process_upload(state: &AppState, mut multipart: Multipart) -> Response 
         );
     }
 
-    // 7. Persist metadata in SQLite
+    // 6. Persist metadata in SQLite
     if let Err(e) =
         db::documents::insert(&state.db, &document_id, &filename, page_count, &ext, chunks.len())
             .await
@@ -335,12 +358,13 @@ async fn process_upload(state: &AppState, mut multipart: Multipart) -> Response 
         return err(StatusCode::INTERNAL_SERVER_ERROR, format!("db insert: {e}"));
     }
 
-    // 8. Save original file for later download (best-effort)
+    // 7. Save original file for later download (best-effort) — a copy of
+    // the temp file received in step 1, which the guard removes.
     let orig_path = state.storage.path_for(&document_id, &filename);
     if let Some(parent) = orig_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Err(e) = std::fs::write(&orig_path, &file_bytes) {
+    if let Err(e) = std::fs::copy(&tmp_path, &orig_path) {
         tracing::warn!(path = %orig_path.display(), error = %e, "could not save original file");
     }
 
@@ -453,6 +477,94 @@ pub(crate) async fn purge_document(state: &AppState, document_id: &str) -> anyho
     Ok(removed)
 }
 
+/// Owns the upload temp file from reception: dropping it removes the file,
+/// so every early return after step 1 — parse failure, empty chunks, failed
+/// upsert — cleans up without a `remove_file` on each path.
+struct RemoveOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Why the streamed receive failed. The partial temp file is already
+/// removed in every case, so the caller only picks a status code.
+#[derive(Debug)]
+enum ReceiveError {
+    /// Body exceeded `max_bytes` — 413.
+    TooLarge,
+    /// A body chunk could not be read (client/network fault) — 400.
+    Read(anyhow::Error),
+    /// The temp file could not be created or written — 500.
+    Write(anyhow::Error),
+}
+
+/// Streams one multipart body to `tmp_path`, hashing incrementally and
+/// rejecting as soon as `max_bytes` is exceeded — the body is never held
+/// in RAM (issue #43). Returns the total bytes and the hex sha256: the
+/// digest is identical to a one-shot hash of the same bytes, so the
+/// provenance chain downstream is unaffected. A partial file is removed on
+/// every error path, including the limit breach (note the explicit `drop`
+/// before removing: on Windows an open file cannot be removed).
+async fn stream_upload_to_file<S, C, E>(
+    chunks: std::pin::Pin<&mut S>,
+    tmp_path: &std::path::Path,
+    max_bytes: u64,
+) -> Result<(u64, String), ReceiveError>
+where
+    S: futures_util::Stream<Item = Result<C, E>>,
+    C: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
+    let mut out = tokio::fs::File::create(tmp_path)
+        .await
+        .map_err(|e| ReceiveError::Write(anyhow::anyhow!("create temp upload file: {e}")))?;
+    let mut hasher = Sha256::new();
+    let mut total: u64 = 0;
+    let mut chunks = chunks;
+    while let Some(item) = chunks.next().await {
+        let chunk = match item {
+            Ok(c) => c,
+            Err(e) => {
+                drop(out);
+                let _ = std::fs::remove_file(tmp_path);
+                return Err(ReceiveError::Read(anyhow::anyhow!("read upload body: {e}")));
+            }
+        };
+        let bytes = chunk.as_ref();
+        total += bytes.len() as u64;
+        if total > max_bytes {
+            drop(out);
+            let _ = std::fs::remove_file(tmp_path);
+            return Err(ReceiveError::TooLarge);
+        }
+        if let Err(e) = out.write_all(bytes).await {
+            drop(out);
+            let _ = std::fs::remove_file(tmp_path);
+            return Err(ReceiveError::Write(anyhow::anyhow!(
+                "write temp upload file: {e}"
+            )));
+        }
+        hasher.update(bytes);
+    }
+    // `tokio::fs::File` dispatches writes to a blocking pool and `drop` does
+    // not wait for them: without this flush the function could return while
+    // the last chunks are still in flight, and the parser would extract text
+    // from a truncated file. Flush errors take the same path as write
+    // errors. (Flush gets the bytes to the OS, which is all the parser —
+    // reading back through the page cache — needs.)
+    if let Err(e) = out.flush().await {
+        drop(out);
+        let _ = std::fs::remove_file(tmp_path);
+        return Err(ReceiveError::Write(anyhow::anyhow!(
+            "flush temp upload file: {e}"
+        )));
+    }
+    drop(out);
+    Ok((total, format!("{:x}", hasher.finalize())))
+}
+
 /// Makes a stored filename safe to interpolate into a quoted
 /// `Content-Disposition` header value.
 ///
@@ -477,7 +589,87 @@ fn sanitize_header_filename(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_header_filename;
+    use super::{sanitize_header_filename, stream_upload_to_file, ReceiveError};
+    use futures_util::stream;
+    use sha2::{Digest, Sha256};
+
+    fn tmp_in(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+        dir.path().join(name)
+    }
+
+    /// Incrementality must be invisible: same length, same digest, same
+    /// bytes on disk as buffering the whole body first.
+    #[tokio::test]
+    async fn streams_chunks_with_one_shot_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = tmp_in(&dir, "up.bin");
+        let chunks = stream::iter(vec![
+            Ok::<Vec<u8>, std::io::Error>(b"hello ".to_vec()),
+            Ok(b"world".to_vec()),
+        ]);
+        futures_util::pin_mut!(chunks);
+        let (len, sha) = stream_upload_to_file(chunks, &tmp, 1024).await.unwrap();
+        assert_eq!(len, 11);
+        let mut expected = Sha256::new();
+        expected.update(b"hello world");
+        assert_eq!(sha, format!("{:x}", expected.finalize()));
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"hello world");
+    }
+
+    #[tokio::test]
+    async fn over_limit_rejects_and_removes_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = tmp_in(&dir, "up.bin");
+        let chunks = stream::iter(vec![
+            Ok::<Vec<u8>, std::io::Error>(b"12345678".to_vec()),
+            Ok(b"way-too-much".to_vec()),
+        ]);
+        futures_util::pin_mut!(chunks);
+        let err = stream_upload_to_file(chunks, &tmp, 10).await.unwrap_err();
+        assert!(matches!(err, ReceiveError::TooLarge));
+        assert!(!tmp.exists(), "partial file must not survive rejection");
+    }
+
+    #[tokio::test]
+    async fn body_read_error_maps_to_read_and_removes_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = tmp_in(&dir, "up.bin");
+        let chunks = stream::iter(vec![
+            Ok::<Vec<u8>, std::io::Error>(b"partial".to_vec()),
+            Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "boom")),
+        ]);
+        futures_util::pin_mut!(chunks);
+        let err = stream_upload_to_file(chunks, &tmp, 1024).await.unwrap_err();
+        assert!(matches!(err, ReceiveError::Read(_)));
+        assert!(!tmp.exists(), "partial file must not survive a broken body");
+    }
+
+    #[tokio::test]
+    async fn unwritable_destination_maps_to_write() {
+        // `blocker` is a regular file, so nothing can be created under it —
+        // on any platform, without touching real system paths.
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let tmp = blocker.join("up.bin");
+        let chunks = stream::iter(vec![Ok::<Vec<u8>, std::io::Error>(b"x".to_vec())]);
+        futures_util::pin_mut!(chunks);
+        let err = stream_upload_to_file(chunks, &tmp, 1024).await.unwrap_err();
+        assert!(matches!(err, ReceiveError::Write(_)));
+    }
+
+    #[tokio::test]
+    async fn empty_body_reports_zero_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = tmp_in(&dir, "up.bin");
+        let chunks = stream::iter(Vec::<Result<Vec<u8>, std::io::Error>>::new());
+        futures_util::pin_mut!(chunks);
+        let (len, sha) = stream_upload_to_file(chunks, &tmp, 1024).await.unwrap();
+        assert_eq!(len, 0);
+        let mut expected = Sha256::new();
+        expected.update(b"");
+        assert_eq!(sha, format!("{:x}", expected.finalize()));
+    }
 
     #[test]
     fn plain_and_unicode_names_pass_through() {
