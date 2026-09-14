@@ -462,6 +462,20 @@ fn unpack_tar_gz(archive: &Path, dest: &Path) -> Result<()> {
             anyhow::bail!("archive entry escapes the destination: {}", path.display());
         }
 
+        // The path check above says nothing about WHAT the entry is: a
+        // symlink or hard link with an innocent path still materialises an
+        // arbitrary target on unpack (and a restored symlink can redirect a
+        // later write outside `dest`). Our own archives only ever contain
+        // regular files (and, harmlessly, directories), so refuse the rest
+        // outright rather than inspecting link targets.
+        let kind = entry.header().entry_type();
+        if !(kind.is_file() || kind.is_dir()) {
+            anyhow::bail!(
+                "archive entry is not a regular file or directory: {}",
+                path.display()
+            );
+        }
+
         let out = dest.join(&path);
         if let Some(parent) = out.parent() {
             std::fs::create_dir_all(parent)
@@ -689,6 +703,93 @@ mod tests {
         assert!(!is_safe_entry_path(Path::new("../escape")));
         assert!(!is_safe_entry_path(Path::new("a/../../escape")));
         assert!(!is_safe_entry_path(Path::new("/etc/passwd")));
+    }
+
+    // ── tar entry types ─────────────────────────────────────────────────────
+
+    type Tarball = (tempfile::TempDir, PathBuf);
+
+    /// Builds a gzipped tarball from raw headers (so the entry types are
+    /// exactly what the test sets, not what a convenience helper derives).
+    /// Returns the tempdir holding it alongside, keeping it alive.
+    fn tarball_with(
+        build: impl FnOnce(&mut tar::Builder<flate2::write::GzEncoder<std::fs::File>>),
+    ) -> Tarball {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("test.tar.gz");
+        let file = std::fs::File::create(&archive).unwrap();
+        let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(gz);
+        build(&mut builder);
+        builder.into_inner().unwrap().finish().unwrap();
+        (dir, archive)
+    }
+
+    fn file_header(path: &str, data_len: u64) -> tar::Header {
+        let mut header = tar::Header::new_gnu();
+        header.set_path(path).unwrap();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(data_len);
+        header.set_cksum();
+        header
+    }
+
+    #[test]
+    fn unpack_accepts_regular_files() {
+        let data = b"database";
+        let (_dir, archive) = tarball_with(|b| {
+            let header = file_header("rag_users.db", data.len() as u64);
+            b.append(&header, &data[..]).unwrap();
+        });
+        let dest = tempfile::tempdir().unwrap();
+        unpack_tar_gz(&archive, dest.path()).unwrap();
+        assert_eq!(
+            std::fs::read(dest.path().join("rag_users.db")).unwrap(),
+            b"database"
+        );
+    }
+
+    /// A symlink with an innocent path still materialises an arbitrary
+    /// target on unpack — and a restored one can redirect a later write
+    /// outside the destination — so the type is refused even though the
+    /// path itself passes `is_safe_entry_path`.
+    #[test]
+    fn unpack_rejects_symlink_entries() {
+        let (_dir, archive) = tarball_with(|b| {
+            let mut header = tar::Header::new_gnu();
+            header.set_path("link").unwrap();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_link_name("/etc/passwd").unwrap();
+            header.set_size(0);
+            header.set_cksum();
+            b.append(&header, std::io::empty()).unwrap();
+        });
+        let dest = tempfile::tempdir().unwrap();
+        let err = unpack_tar_gz(&archive, dest.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!dest.path().join("link").exists());
+    }
+
+    #[test]
+    fn unpack_rejects_hardlink_entries() {
+        let (_dir, archive) = tarball_with(|b| {
+            let mut header = tar::Header::new_gnu();
+            header.set_path("alias").unwrap();
+            header.set_entry_type(tar::EntryType::Link);
+            header.set_link_name("rag_users.db").unwrap();
+            header.set_size(0);
+            header.set_cksum();
+            b.append(&header, std::io::empty()).unwrap();
+        });
+        let dest = tempfile::tempdir().unwrap();
+        let err = unpack_tar_gz(&archive, dest.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]
