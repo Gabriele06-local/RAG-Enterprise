@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use anyhow::Context;
 use sqlx::SqlitePool;
 
@@ -58,23 +59,84 @@ pub struct AppState {
     /// auth::throttle for why it throttles by username and total concurrency
     /// rather than by client IP.
     pub login_throttle: Arc<LoginThrottle>,
+    /// One permit: the ingestion window (unload → embed → reload) runs one at
+    /// a time. See IngestionGuard::start for what happens when it does not.
+    pub ingestion_slot: Arc<Semaphore>,
 }
 
-/// RAII guard: increments active_ingestions on creation and ALWAYS decrements
-/// on Drop, including on the error and early-return paths in upload(), so no
-/// exit point has to remember to do it.
-pub struct IngestionGuard(Arc<AtomicUsize>);
+/// RAII for the active_ingestions count on its own.
+///
+/// Its own type, and not just a `fetch_add` inside IngestionGuard::start,
+/// because the count has to be claimed BEFORE the wait for the slot — and a
+/// bare increment before an `.await` is a leak waiting to happen. A client
+/// that disconnects while its upload is queued has axum drop the handler
+/// future mid-await; nothing would ever undo that increment, and
+/// ingestion_blocks_queries() would answer true for the life of the process,
+/// rejecting every query until someone restarted it. Owning the decrement in
+/// a value that already exists before the await makes cancellation give the
+/// count back for free.
+struct CountedIngestion(Arc<AtomicUsize>);
 
-impl IngestionGuard {
-    pub fn start(counter: &Arc<AtomicUsize>) -> Self {
+impl CountedIngestion {
+    fn start(counter: &Arc<AtomicUsize>) -> Self {
         counter.fetch_add(1, Ordering::SeqCst);
         Self(counter.clone())
     }
 }
 
-impl Drop for IngestionGuard {
+impl Drop for CountedIngestion {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// RAII guard: holds the one ingestion permit and keeps active_ingestions
+/// above zero for as long as it lives, ALWAYS releasing both on Drop —
+/// including on the error and early-return paths in upload(), so no exit
+/// point has to remember to do it.
+pub struct IngestionGuard {
+    /// Both fields are held, never read; dropping them is the whole point.
+    /// Their declaration order is not load-bearing — see start() for why the
+    /// count cannot reach zero during a handoff either way.
+    _counted: CountedIngestion,
+    /// Dropping this is what lets the next upload in.
+    _permit: OwnedSemaphorePermit,
+}
+
+impl IngestionGuard {
+    /// Counts this ingestion, then waits for the slot — in that order.
+    ///
+    /// The window the slot guards is unload eullm → move bge-m3 onto the GPU
+    /// → parse, chunk, embed → move it back → reload eullm, and running two
+    /// of those at once breaks in a way that looks like nothing at all:
+    /// upload A finishes and reloads the chat model into VRAM while upload B
+    /// is still embedding on the GPU, B hits CUDA OOM, falls back to the CPU
+    /// and finishes an order of magnitude slower, having reported no error to
+    /// anyone. Serialised, the two uploads take about as long as they did
+    /// before and neither degrades.
+    ///
+    /// The order matters as much as the serialising does. Counting only once
+    /// the slot is won leaves a gap: A's guard drops and decrements to zero,
+    /// and B is still parked inside acquire_owned() and has counted nothing,
+    /// so for that instant active_ingestions reads zero on a multithreaded
+    /// runtime and a concurrent /api/query sails past
+    /// ingestion_blocks_queries() — straight into the upload that was next in
+    /// the queue unloading eullm underneath it. Counted first, a queued
+    /// upload is an ingestion in progress from the moment it arrives, which
+    /// is also what a user watching "ingestion in progress" would expect, and
+    /// what the counter meant before there was a queue at all.
+    ///
+    /// The second upload does wait here with its request body already in
+    /// hand — the trade is a queued HTTP request against two ingestions
+    /// fighting over the same card, and the queue is the better half of it.
+    pub async fn start(counter: &Arc<AtomicUsize>, slot: &Arc<Semaphore>) -> Self {
+        let counted = CountedIngestion::start(counter);
+        let permit = slot
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the ingestion semaphore is never closed");
+        Self { _counted: counted, _permit: permit }
     }
 }
 
@@ -100,6 +162,7 @@ impl AppState {
             live_bench,
             extensions: Arc::new(extensions),
             login_throttle: Arc::new(LoginThrottle::new()),
+            ingestion_slot: Arc::new(Semaphore::new(1)),
         }
     }
 
@@ -171,6 +234,84 @@ fn ingestion_blocks(unload_during_ingestion: bool, active_ingestions: &AtomicUsi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Waits until `counter` reaches `n`, so the test observes the queued
+    /// upload having registered rather than guessing at a delay.
+    ///
+    /// Bounded, not a bare spin. If the count is ever taken after the slot
+    /// again instead of before it, a queued upload never registers at all
+    /// and an unbounded loop would hang the test — which in CI reads as a
+    /// job that timed out, not as the regression it actually is.
+    async fn wait_for(counter: &Arc<AtomicUsize>, n: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while counter.load(Ordering::SeqCst) < n {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "active_ingestions never reached {n}: a queued upload is not counting \
+                 itself, so the count drops to zero between two uploads"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// The regression this ordering exists for. With the count taken after
+    /// the slot instead of before it, the assertion right after `drop(a)`
+    /// reads zero: A has given the count back and B, still parked inside
+    /// acquire_owned(), has not taken one. A query arriving in that instant
+    /// passes ingestion_blocks_queries() and then has eullm unloaded under
+    /// it by the upload that was next in line.
+    #[tokio::test]
+    async fn a_queued_upload_holds_the_count_through_the_handoff() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let slot = Arc::new(Semaphore::new(1));
+
+        let a = IngestionGuard::start(&counter, &slot).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        let (c, s) = (counter.clone(), slot.clone());
+        let queued = tokio::spawn(async move { IngestionGuard::start(&c, &s).await });
+        wait_for(&counter, 2).await;
+
+        // Single-threaded test runtime: dropping A cannot yield, so B has
+        // provably not woken up yet when this reads the counter.
+        drop(a);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "the count must not dip to zero while an upload is still queued"
+        );
+
+        let b = queued.await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        drop(b);
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    /// What CountedIngestion is a separate type for: a client that hangs up
+    /// while its upload is queued has axum drop the handler future
+    /// mid-await. A plain increment before that await would never be undone,
+    /// and ingestion_blocks_queries() would answer true until restart.
+    #[tokio::test]
+    async fn abandoning_a_queued_upload_gives_the_count_back() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let slot = Arc::new(Semaphore::new(1));
+
+        let a = IngestionGuard::start(&counter, &slot).await;
+        let (c, s) = (counter.clone(), slot.clone());
+        let queued = tokio::spawn(async move { IngestionGuard::start(&c, &s).await });
+        wait_for(&counter, 2).await;
+
+        queued.abort();
+        let _ = queued.await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "an abandoned queued upload must not leak its count"
+        );
+
+        drop(a);
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn ingestion_blocks_false_when_feature_disabled() {

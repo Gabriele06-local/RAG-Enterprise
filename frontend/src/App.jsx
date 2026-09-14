@@ -628,6 +628,28 @@ function App() {
 
           if (payload.token !== undefined) {
             appendToken(payload.token)
+          } else if (payload.error) {
+            // Generation was cut off (see StreamItem::Failed in
+            // clients/eullm.rs): the backend does not persist the partial
+            // text, so it will not come back as the answer on the next load.
+            // What already arrived stays on screen but marked as an error —
+            // hiding it would make text the user just watched arrive vanish.
+            if (assistantPushed) {
+              setMessages(prev => {
+                const next = [...prev]
+                const last = next[next.length - 1]
+                next[next.length - 1] = {
+                  ...last, content: `${last.content}\n\n[${payload.error}]`, error: true,
+                }
+                return next
+              })
+            } else {
+              assistantPushed = true
+              setMessages(prev => [...prev, {
+                role: 'assistant', content: `Errore: ${payload.error}`,
+                error: true, timestamp: new Date().toISOString(),
+              }])
+            }
           } else if (payload.done) {
             if (assistantPushed) {
               setMessages(prev => {

@@ -56,13 +56,15 @@ pub async fn upload(
     if !claims.role.can_upload() {
         return err(StatusCode::FORBIDDEN, "insufficient permissions to upload documents");
     }
-    // The guard stays alive — keeping active_ingestions > 0, see
-    // AppState::ingestion_blocks_queries — for the WHOLE window of
-    // unload → extract/chunk/embed → reload, not just the heavy part. If it
-    // were dropped before the reload, a concurrent query would load eullm
-    // again on its own while the embedding model is still using the freed
-    // VRAM.
-    let _ingestion_guard = crate::state::IngestionGuard::start(&state.active_ingestions);
+    // The guard does two things, both for the WHOLE window of
+    // unload → extract/chunk/embed → reload rather than just the heavy part.
+    // It keeps active_ingestions > 0 (see AppState::ingestion_blocks_queries):
+    // dropped before the reload, a concurrent query would load eullm again on
+    // its own while the embedding model is still using the freed VRAM. And it
+    // holds the single ingestion permit, so a second upload waits here instead
+    // of reloading the chat model into VRAM that this one is still embedding
+    // in — see IngestionGuard::start.
+    let _ingestion_guard = crate::state::IngestionGuard::start(&state.active_ingestions, &state.ingestion_slot).await;
     let unload_enabled = state.settings.eullm.unload_during_ingestion;
     let ingestion_embedding = state.settings.embeddings.ingestion_embedding;
     let candle_gpu = ingestion_embedding == crate::config::IngestionEmbedding::CandleGpu;

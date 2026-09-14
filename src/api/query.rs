@@ -23,6 +23,7 @@ use serde_json::json;
 
 use crate::auth::jwt::Claims;
 use crate::bench;
+use crate::clients::eullm::StreamItem;
 use crate::db;
 use crate::rag::{prompt, retrieval, sources::Source, vector_store::ChunkPayload};
 use crate::state::AppState;
@@ -244,6 +245,30 @@ async fn build_history_pairs(
     Ok(pairs)
 }
 
+/// Rejects a `conversation_id` the caller does not own, before any work is
+/// done on the request.
+///
+/// The id arrives in the request body, so it is the client's word for which
+/// conversation this is. Reads have always been safe — every statement in
+/// db::conversations filters by user_id too — but the write paths below file
+/// the question and the answer under whatever id came in, and inserting under
+/// someone else's conversation bumps it to the top of their list. `None` (no
+/// conversation) is legitimate and passes through.
+async fn check_conversation_owned(
+    state: &AppState,
+    conv_id: Option<&str>,
+    user_id: i64,
+) -> Result<(), Response> {
+    let Some(cid) = conv_id else { return Ok(()) };
+    match db::conversations::is_owned_by(&state.db, cid, user_id).await {
+        // 404, not 403: whether someone else's conversation exists is not
+        // something to confirm to this user.
+        Ok(true) => Ok(()),
+        Ok(false) => Err(err(StatusCode::NOT_FOUND, "conversation not found")),
+        Err(e) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
+    }
+}
+
 // ── POST /api/query ───────────────────────────────────────────────────────────
 
 pub async fn query(
@@ -258,6 +283,9 @@ pub async fn query(
         return err(StatusCode::BAD_REQUEST, msg);
     }
     let conv_id = req.conversation_id.as_deref();
+    if let Err(resp) = check_conversation_owned(&state, conv_id, claims.user_id).await {
+        return resp;
+    }
     // _timings: not instrumented — the frontend uses /api/query/stream (see
     // query_stream), which is where --bench-live records real queries.
     let (full_prompt, sources, _timings) =
@@ -308,7 +336,7 @@ pub async fn query(
 /// TTFT and decode for --bench-live, since this is the one the frontend
 /// uses.
 struct StreamState {
-    rx: tokio::sync::mpsc::Receiver<String>,
+    rx: tokio::sync::mpsc::Receiver<StreamItem>,
     acc: String,
     sources: Vec<Source>,
     db: sqlx::SqlitePool,
@@ -336,6 +364,9 @@ pub async fn query_stream(
         return err(StatusCode::BAD_REQUEST, msg);
     }
     let conv_id = req.conversation_id.as_deref();
+    if let Err(resp) = check_conversation_owned(&state, conv_id, claims.user_id).await {
+        return resp;
+    }
     // Run setup synchronously before opening the SSE stream so we can return
     // a proper HTTP error if embed/search fails.
     let (full_prompt, sources, timings) =
@@ -353,7 +384,7 @@ pub async fn query_stream(
     .await;
 
     // Start eullm streaming in background.
-    let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+    let (tx, rx) = tokio::sync::mpsc::channel::<StreamItem>(64);
     let eullm = state.eullm.clone();
     let prompt_clone = full_prompt.clone();
     tokio::spawn(async move {
@@ -385,7 +416,7 @@ pub async fn query_stream(
             return None;
         }
         match s.rx.recv().await {
-            Some(token) => {
+            Some(StreamItem::Token(token)) => {
                 if s.ttft.is_none() {
                     s.ttft = Some(s.gen_start.elapsed());
                 }
@@ -394,8 +425,29 @@ pub async fn query_stream(
                 let ev = Event::default().data(json!({ "token": token }).to_string());
                 Some((Ok::<_, Infallible>(ev), s))
             }
+            Some(StreamItem::Failed) => {
+                // Generation was severed part-way. What arrived is NOT the
+                // model's answer, so it is deliberately not persisted: stored,
+                // it would come back as the assistant's reply on every reload
+                // and — with use_history on — be replayed to the model as if
+                // it had actually said it, half-sentence and all. Nor is it
+                // recorded as a benchmark sample, which would read as a fast
+                // short generation rather than a failed one. The cause is in
+                // the log (the spawned task above records it); the client is
+                // told only that the answer is incomplete.
+                tracing::warn!(
+                    tokens = s.tokens,
+                    "eullm stream: generation interrupted, partial answer discarded"
+                );
+                let ev = Event::default().data(
+                    json!({ "error": "generation interrupted before completion" }).to_string(),
+                );
+                s.done = true;
+                Some((Ok::<_, Infallible>(ev), s))
+            }
             None => {
-                // Channel closed — persist the assistant reply, if non-empty
+                // Channel closed with no failure marker — a clean end of
+                // generation. Persist the assistant reply, if non-empty
                 // (see the non-streaming query() for why), and emit the final
                 // event.
                 let total_generation = s.gen_start.elapsed();

@@ -16,15 +16,19 @@ use async_trait::async_trait;
 use qdrant_client::{
     Payload, Qdrant,
     qdrant::{
-        Condition, CreateCollectionBuilder, DeletePointsBuilder, Distance, Filter,
-        PointStruct, SearchPointsBuilder, UpsertPointsBuilder,
-        VectorParamsBuilder, VectorsConfig, vectors_config::Config,
+        Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder,
+        DeletePointsBuilder, Distance, FieldType, Filter, PointStruct,
+        SearchPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
+        VectorsConfig, vectors_config::Config,
     },
 };
 
 use crate::rag::vector_store::{ChunkPayload, SearchHit, VectorStore};
 
 pub const VECTOR_DIM: u64 = 1024;
+
+/// The one payload field this code filters on — see ensure_document_id_index.
+const DOCUMENT_ID_FIELD: &str = "document_id";
 
 pub struct QdrantStore {
     client: Qdrant,
@@ -51,9 +55,52 @@ impl QdrantStore {
                     }),
                 )
                 .await?;
-            tracing::info!(collection = %self.collection, "collection Qdrant creata");
+            tracing::info!(collection = %self.collection, "Qdrant collection created");
         }
+        self.ensure_document_id_index().await;
         Ok(())
+    }
+
+    /// Payload index on `document_id`.
+    ///
+    /// Without one, Qdrant answers a `document_id` filter — which is every
+    /// delete_document call — by reading the payload of every point in the
+    /// collection. At ten thousand documents, removing one of them means
+    /// scanning millions of points to find its few hundred.
+    ///
+    /// Deliberately outside the `if !exists` above: a collection created by
+    /// an earlier version is already there and has no index, and would never
+    /// acquire one if this only ran at creation time. Qdrant treats a repeat
+    /// request for an index that already exists as a no-op, so running it on
+    /// every startup is free.
+    ///
+    /// Returns nothing, and logs rather than propagates: an index is a matter
+    /// of how fast a delete is, not whether the engine works, so a Qdrant
+    /// that refuses it must not be a Qdrant this binary refuses to start
+    /// against.
+    async fn ensure_document_id_index(&self) {
+        match self
+            .client
+            .create_field_index(CreateFieldIndexCollectionBuilder::new(
+                &self.collection,
+                DOCUMENT_ID_FIELD,
+                FieldType::Keyword,
+            ))
+            .await
+        {
+            Ok(_) => tracing::debug!(
+                collection = %self.collection,
+                field = DOCUMENT_ID_FIELD,
+                "Qdrant payload index in place"
+            ),
+            Err(e) => tracing::warn!(
+                collection = %self.collection,
+                field = DOCUMENT_ID_FIELD,
+                error = %e,
+                "Qdrant payload index not created: per-document deletes will scan \
+                 the whole collection"
+            ),
+        }
     }
 }
 
@@ -135,23 +182,47 @@ impl VectorStore for QdrantStore {
             builder = builder.score_threshold(t);
         }
         let resp = self.client.search_points(builder).await?;
-        let hits = resp
+        let returned = resp.result.len();
+        let hits: Vec<SearchHit> = resp
             .result
             .into_iter()
             .filter_map(|hit| {
+                let id = hit.id.as_ref().map(|i| format!("{i:?}")).unwrap_or_default();
                 let raw: serde_json::Map<String, serde_json::Value> =
                     hit.payload.into_iter().map(|(k, v)| (k, v.into())).collect();
-                let payload: ChunkPayload =
-                    serde_json::from_value(serde_json::Value::Object(raw)).ok()?;
-                Some(SearchHit { similarity: hit.score, payload })
+                match serde_json::from_value::<ChunkPayload>(serde_json::Value::Object(raw)) {
+                    Ok(payload) => Some(SearchHit { similarity: hit.score, payload }),
+                    // A point Qdrant matched but whose payload will not parse
+                    // is a chunk the user's question found and the answer will
+                    // not contain — written by an older schema, or by another
+                    // tool against the same collection. Dropping it silently
+                    // is what made "the answer ignores a document I know is in
+                    // there" impossible to explain from the outside.
+                    Err(e) => {
+                        tracing::warn!(
+                            point_id = %id,
+                            error = %e,
+                            "Qdrant: payload will not deserialize, point excluded from the results"
+                        );
+                        None
+                    }
+                }
             })
             .collect();
+        if hits.len() != returned {
+            tracing::warn!(
+                returned,
+                usable = hits.len(),
+                "Qdrant: dropped {} of {returned} points with unreadable payloads",
+                returned - hits.len()
+            );
+        }
         Ok(hits)
     }
 
     async fn delete_document(&self, document_id: &str) -> Result<()> {
         let filter =
-            Filter::must([Condition::matches("document_id", document_id.to_owned())]);
+            Filter::must([Condition::matches(DOCUMENT_ID_FIELD, document_id.to_owned())]);
         self.client
             .delete_points(
                 DeletePointsBuilder::new(&self.collection)
@@ -160,7 +231,7 @@ impl VectorStore for QdrantStore {
             )
             .await
             .with_context(|| format!("qdrant delete_document {document_id}"))?;
-        tracing::info!(document_id = %document_id, "vettori Qdrant eliminati");
+        tracing::info!(document_id = %document_id, "Qdrant vectors deleted");
         Ok(())
     }
 }
