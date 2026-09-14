@@ -15,16 +15,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Fixed
+### Performance
 
-
-- **Restore refuses non-regular tar entries, not just escaping paths.**
-  `unpack_tar_gz` checked each entry's path against traversal but never
-  its type: a symlink or hard link with an innocent path still
-  materialised an arbitrary target on unpack, and a restored symlink
-  could redirect a later write outside the destination. Only regular
-  files and directories are now unpacked — everything this project's
-  own archives ever contain.
+- **The upload and backup handlers no longer block the async executor on
+  disk I/O.** Saving the original file copied it with `std::fs::copy`
+  straight inside the handler, which stalls every other request sharing
+  that worker thread for as long as the copy takes — up to the whole
+  configured upload limit. Listing backups did the same with a
+  synchronous `read_dir`. Both use `tokio::fs` now, as do the cleanup
+  paths around them. The one exception is the staging file's `Drop`
+  guard, which cannot await: an unlink is a syscall rather than a
+  transfer, which is the part that actually mattered.
 - **Uploads stream to disk instead of being buffered in RAM.**
   `process_upload` used to load the entire body into a `Vec<u8>` (plus
   a transient copy) before hashing and writing it, so a few concurrent
@@ -37,6 +38,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   backstop; the parser interface is unchanged, and a partial temp file is
   removed on every error path.
 
+### Fixed
+
+- **Restore refuses non-regular tar entries, not just escaping paths.**
+  `unpack_tar_gz` checked each entry's path against traversal but never
+  its type: a symlink or hard link with an innocent path still
+  materialised an arbitrary target on unpack, and a restored symlink
+  could redirect a later write outside the destination. Only regular
+  files and directories are now unpacked — everything this project's
+  own archives ever contain.
+
+### Security
+
+- **Uploads are staged owner-only, under the data directory, and only
+  after the format is accepted.** Three things about the file an upload
+  is written to while it is parsed. It was created with the default
+  `0644`, so on a shared host every other local user could read whatever
+  was being ingested for as long as the parse took; it is now `0600` on
+  Unix. It lived in the system temp directory, which on most Linux
+  installs is a tmpfs — that is RAM, so a large upload went straight back
+  into the memory that streaming to disk exists to avoid, and on a small
+  ARM board could fill it; staging now lives in `{DATA__DIR}/tmp`, which
+  is also on the same filesystem as the originals store. And the
+  extension was checked only by the parser, at step 2 — a `.pptx` was
+  written out in full, up to the configured limit, and only then
+  refused; an unsupported format is now a `415` before a single byte is
+  written.
+
+  Because staging left the system temp directory it also left the
+  operating system's cleanup of it, so the startup sequence now sweeps
+  `{DATA__DIR}/tmp` — safe there and only there, since no upload can be
+  in flight before the server accepts requests, and every file present is
+  by definition left over from a process that died mid-upload.
 
 ---
 

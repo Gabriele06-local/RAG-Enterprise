@@ -81,7 +81,7 @@ pub async fn list_backups(State(state): State<AppState>, claims: Claims) -> Resp
     if let Some(r) = require_admin(&claims) {
         return r;
     }
-    let archives = service::list_backups(&state.settings.backup.dir);
+    let archives = service::list_backups(&state.settings.backup.dir).await;
     Json(json!({ "backups": archives })).into_response()
 }
 

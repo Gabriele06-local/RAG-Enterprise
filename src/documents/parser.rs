@@ -56,6 +56,21 @@ pub struct ExtractedText {
 /// `data_dir` is the data root (`Settings.data.data_path()`), needed only by
 /// the OCR branch to find `{data_dir}/tessdata/`, where the manifest
 /// downloads it.
+/// Extensions `extract_text` below knows how to read.
+///
+/// Exported so the upload handler can refuse an unsupported file BEFORE
+/// streaming it to disk: a .pptx used to be written out in full — up to the
+/// configured limit — and only then rejected by the match in extract_text.
+/// The two are pinned together by a test in this module; if you add an arm
+/// below, add it here too or that test fails.
+pub const SUPPORTED_EXTENSIONS: &[&str] =
+    &["txt", "md", "csv", "pdf", "docx", "doc", "xlsx", "xls", "html", "htm"];
+
+/// Whether `ext` (lowercase, no dot) is one this parser can read.
+pub fn is_supported_extension(ext: &str) -> bool {
+    SUPPORTED_EXTENSIONS.contains(&ext)
+}
+
 pub fn extract_text(path: &Path, data_dir: &Path) -> Result<ExtractedText> {
     let ext = path
         .extension()
@@ -310,6 +325,38 @@ fn extract_html(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins SUPPORTED_EXTENSIONS to extract_text's own match. A list that
+    /// drifts from the dispatch is worse than no list: the upload handler
+    /// would accept a file the parser then refuses, or refuse one it can
+    /// read. Each extension is exercised against an empty file — what
+    /// matters is only that the answer is NOT "unsupported format", which
+    /// is the one error the dispatch's catch-all arm produces.
+    #[test]
+    fn supported_extensions_match_the_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        for ext in SUPPORTED_EXTENSIONS {
+            assert!(is_supported_extension(ext), "{ext} missing from is_supported_extension");
+            let f = dir.path().join(format!("probe.{ext}"));
+            std::fs::write(&f, b"").unwrap();
+            if let Err(e) = extract_text(&f, dir.path()) {
+                assert!(
+                    !e.to_string().contains("unsupported format"),
+                    ".{ext} is in SUPPORTED_EXTENSIONS but extract_text does not dispatch it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unlisted_extension_is_refused_by_both() {
+        assert!(!is_supported_extension("pptx"));
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("deck.pptx");
+        std::fs::write(&f, b"").unwrap();
+        let e = extract_text(&f, dir.path()).unwrap_err();
+        assert!(e.to_string().contains("unsupported format"), "unexpected: {e}");
+    }
 
     fn span(page: u32, start: usize, end: usize) -> PageSpan {
         PageSpan { page, start_byte: start, end_byte: end }

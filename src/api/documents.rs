@@ -151,7 +151,23 @@ async fn process_upload(state: &AppState, mut multipart: Multipart) -> Response 
                         .and_then(|e| e.to_str())
                         .unwrap_or("")
                         .to_lowercase();
-                    tmp_path = std::env::temp_dir().join(format!("{}.{ext}", uuid::Uuid::new_v4()));
+                    // Refuse a format the parser cannot read BEFORE writing
+                    // any of it. Until now a .pptx was streamed to disk in
+                    // full — up to the configured limit — and only then
+                    // rejected by extract_text at step 2.
+                    if !parser::is_supported_extension(&ext) {
+                        return err(
+                            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                            format!(
+                                "unsupported format: .{ext} — accepted: {}",
+                                parser::SUPPORTED_EXTENSIONS.join(", ")
+                            ),
+                        );
+                    }
+                    tmp_path = match upload_tmp_path(state, &ext).await {
+                        Ok(p) => p,
+                        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+                    };
                     futures_util::pin_mut!(field);
                     match stream_upload_to_file(field, &tmp_path, max_bytes).await {
                         Ok((len, sha)) => {
@@ -362,9 +378,12 @@ async fn process_upload(state: &AppState, mut multipart: Multipart) -> Response 
     // the temp file received in step 1, which the guard removes.
     let orig_path = state.storage.path_for(&document_id, &filename);
     if let Some(parent) = orig_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        let _ = tokio::fs::create_dir_all(parent).await;
     }
-    if let Err(e) = std::fs::copy(&tmp_path, &orig_path) {
+    // tokio::fs, not std::fs: this copies the whole upload, up to the
+    // configured limit, and on the async executor that stalls every other
+    // request on the same worker thread for the duration.
+    if let Err(e) = tokio::fs::copy(&tmp_path, &orig_path).await {
         tracing::warn!(path = %orig_path.display(), error = %e, "could not save original file");
     }
 
@@ -464,17 +483,50 @@ pub(crate) async fn purge_document(state: &AppState, document_id: &str) -> anyho
     if removed {
         if let Some(d) = &doc {
             let file_path = state.storage.path_for(document_id, &d.filename);
-            let _ = std::fs::remove_file(&file_path);
+            let _ = tokio::fs::remove_file(&file_path).await;
             // parent() is {base}/{document_id}; remove_dir fails, and is
             // ignored, when it is not empty, so it never touches anything that
             // is not ours.
             if let Some(parent) = file_path.parent() {
-                let _ = std::fs::remove_dir(parent);
+                let _ = tokio::fs::remove_dir(parent).await;
             }
         }
     }
 
     Ok(removed)
+}
+
+/// Where an upload is staged while it is parsed, and with what permissions.
+///
+/// Under the data directory, not `std::env::temp_dir()`. Two reasons, and
+/// the first is the one that matters: on most Linux installs `/tmp` is a
+/// tmpfs, which is RAM — so streaming a large upload there put it straight
+/// back into the memory that streaming to disk exists to avoid, and on a
+/// small ARM board could fill it. The second is that the data directory is
+/// on the same filesystem as the originals store, which keeps the copy at
+/// step 7 local instead of crossing devices.
+///
+/// Created with mode 0600 on Unix. The default is 0644: on a shared host,
+/// every other local user could read whatever was being ingested for as
+/// long as the parse took.
+async fn upload_tmp_path(state: &AppState, ext: &str) -> anyhow::Result<std::path::PathBuf> {
+    let dir = state.settings.data.data_path().join("tmp");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .with_context(|| format!("creating upload staging dir {}", dir.display()))?;
+    Ok(dir.join(format!("{}.{ext}", uuid::Uuid::new_v4())))
+}
+
+/// Creates the staging file with owner-only permissions where the platform
+/// has them. Split out so `stream_upload_to_file` stays about streaming.
+async fn create_private_file(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    // tokio's own OpenOptions::mode, not the std extension trait — it is
+    // already cfg(unix) on this side.
+    #[cfg(unix)]
+    opts.mode(0o600);
+    opts.open(path).await
 }
 
 /// Owns the upload temp file from reception: dropping it removes the file,
@@ -484,6 +536,11 @@ struct RemoveOnDrop(std::path::PathBuf);
 
 impl Drop for RemoveOnDrop {
     fn drop(&mut self) {
+        // The one std::fs call left on this path, and it has to be: Drop is
+        // not async, so there is nowhere to await tokio::fs here. An unlink
+        // is a metadata operation rather than a transfer, so the executor
+        // stall is a syscall rather than the length of a file — which is
+        // what E4 was actually about.
         let _ = std::fs::remove_file(&self.0);
     }
 }
@@ -517,7 +574,7 @@ where
     C: AsRef<[u8]>,
     E: std::fmt::Display,
 {
-    let mut out = tokio::fs::File::create(tmp_path)
+    let mut out = create_private_file(tmp_path)
         .await
         .map_err(|e| ReceiveError::Write(anyhow::anyhow!("create temp upload file: {e}")))?;
     let mut hasher = Sha256::new();
@@ -528,7 +585,7 @@ where
             Ok(c) => c,
             Err(e) => {
                 drop(out);
-                let _ = std::fs::remove_file(tmp_path);
+                let _ = tokio::fs::remove_file(tmp_path).await;
                 return Err(ReceiveError::Read(anyhow::anyhow!("read upload body: {e}")));
             }
         };
@@ -536,12 +593,12 @@ where
         total += bytes.len() as u64;
         if total > max_bytes {
             drop(out);
-            let _ = std::fs::remove_file(tmp_path);
+            let _ = tokio::fs::remove_file(tmp_path).await;
             return Err(ReceiveError::TooLarge);
         }
         if let Err(e) = out.write_all(bytes).await {
             drop(out);
-            let _ = std::fs::remove_file(tmp_path);
+            let _ = tokio::fs::remove_file(tmp_path).await;
             return Err(ReceiveError::Write(anyhow::anyhow!(
                 "write temp upload file: {e}"
             )));
@@ -556,7 +613,7 @@ where
     // reading back through the page cache — needs.)
     if let Err(e) = out.flush().await {
         drop(out);
-        let _ = std::fs::remove_file(tmp_path);
+        let _ = tokio::fs::remove_file(tmp_path).await;
         return Err(ReceiveError::Write(anyhow::anyhow!(
             "flush temp upload file: {e}"
         )));
@@ -589,7 +646,7 @@ fn sanitize_header_filename(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_header_filename, stream_upload_to_file, ReceiveError};
+    use super::{create_private_file, sanitize_header_filename, stream_upload_to_file, ReceiveError};
     use futures_util::stream;
     use sha2::{Digest, Sha256};
 
@@ -599,6 +656,34 @@ mod tests {
 
     /// Incrementality must be invisible: same length, same digest, same
     /// bytes on disk as buffering the whole body first.
+    /// The staging file must not be world-readable: on a shared host the
+    /// default 0644 let every other local user read whatever was being
+    /// ingested, for as long as the parse took.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn staging_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = tmp_in(&dir, "up.bin");
+        let f = create_private_file(&tmp).await.unwrap();
+        drop(f);
+        let mode = std::fs::metadata(&tmp).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "got {:o}", mode & 0o777);
+    }
+
+    /// create_new, so a staging path that somehow already exists is an
+    /// error rather than a file we truncate — the uuid makes a collision
+    /// implausible, not impossible.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn staging_file_refuses_to_clobber() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = tmp_in(&dir, "taken.bin");
+        std::fs::write(&tmp, b"existing").unwrap();
+        assert!(create_private_file(&tmp).await.is_err());
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"existing");
+    }
+
     #[tokio::test]
     async fn streams_chunks_with_one_shot_digest() {
         let dir = tempfile::tempdir().unwrap();

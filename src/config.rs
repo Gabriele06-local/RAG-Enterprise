@@ -319,7 +319,7 @@ impl StorageSettings {
 pub const MAX_UPLOAD_MB: u64 = 1024;
 
 /// Radice dati: binari, modelli, storage Qdrant, db SQLite, uploads.
-/// Layout: {dir}/bin/  {dir}/models/  {dir}/storage/  {dir}/db/  {dir}/uploads/
+/// Layout: {dir}/bin/  {dir}/models/  {dir}/storage/  {dir}/db/  {dir}/uploads/  {dir}/tmp/
 #[derive(Debug, Deserialize)]
 pub struct DataSettings {
     /// Percorso radice (default: cartella dell'eseguibile — portable app dir).
