@@ -29,6 +29,15 @@ pub struct ServerSettings {
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    /// Origins allowed to call this API from a browser, comma-separated.
+    ///
+    /// Empty by default, and empty means *no CORS layer at all* — which is
+    /// the correct production setting: this binary serves its own frontend
+    /// from its own origin, so cross-origin requests are never part of
+    /// normal use. The only thing that needs this is a Vite dev server on
+    /// another port (`SERVER__CORS_ORIGINS=http://localhost:5173`).
+    #[serde(default)]
+    pub cors_origins: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,7 +51,13 @@ pub struct AuthSettings {
     pub jwt_secret: String,
     #[serde(default = "default_jwt_expiry")]
     pub jwt_expiry_minutes: u64,
+    /// Seeds the admin password on a FRESH installation only. Ignored, with a
+    /// warning, once the admin account exists — see db::users::seed_admin.
     pub admin_default_password: Option<String>,
+    /// Overwrites the admin password at startup, deliberately. The escape
+    /// hatch for being locked out; unset it once used.
+    #[serde(default)]
+    pub admin_reset_password: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -319,7 +334,9 @@ fn expand_tilde(s: &str) -> PathBuf {
 }
 
 impl Default for ServerSettings {
-    fn default() -> Self { Self { host: default_host(), port: default_port() } }
+    fn default() -> Self {
+        Self { host: default_host(), port: default_port(), cors_origins: String::new() }
+    }
 }
 impl Default for DatabaseSettings {
     fn default() -> Self { Self { url: default_db_url() } }
@@ -511,6 +528,23 @@ pub(crate) fn host_is_loopback(host: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Splits `SERVER__CORS_ORIGINS` into the origins it names.
+///
+/// Empty in, empty out — and an empty result means the router attaches no
+/// CORS layer whatsoever, rather than an empty allow-list. Blank entries and
+/// surrounding spaces are dropped, so a trailing comma or `a, b` cannot
+/// produce a phantom origin.
+///
+/// A free function so the parsing can be tested without environment
+/// variables, like `host_is_loopback` above.
+pub(crate) fn parse_cors_origins(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Extracted from Settings::load so it can be tested without touching real
 /// environment variables — the same reason ingestion_blocks in state.rs is a
 /// free function. Fails loudly instead of silently ignoring an inconsistent
@@ -635,6 +669,7 @@ mod tests {
             jwt_secret: secret.to_owned(),
             jwt_expiry_minutes: expiry_minutes,
             admin_default_password: None,
+            admin_reset_password: None,
         }
     }
 
@@ -685,6 +720,25 @@ mod tests {
         for host in ["127.0.0.1", "::1", "localhost", "LOCALHOST", "127.3.2.1"] {
             assert!(host_is_loopback(host), "host={host:?}");
         }
+    }
+
+    #[test]
+    fn no_cors_origins_means_no_origins() {
+        for raw in ["", "   ", ",", " , , "] {
+            assert!(parse_cors_origins(raw).is_empty(), "raw={raw:?}");
+        }
+    }
+
+    #[test]
+    fn cors_origins_are_split_and_trimmed() {
+        assert_eq!(
+            parse_cors_origins("http://localhost:5173"),
+            vec!["http://localhost:5173"]
+        );
+        assert_eq!(
+            parse_cors_origins(" http://a.test , https://b.test ,"),
+            vec!["http://a.test", "https://b.test"]
+        );
     }
 
     #[test]

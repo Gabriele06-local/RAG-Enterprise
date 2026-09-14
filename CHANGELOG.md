@@ -78,6 +78,88 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- **A question now has a maximum length, and the embedder truncates
+  regardless.** The only limit was axum's 2 MB default body: a question
+  that size was tokenised whole, embedded on the CPU, and pasted into the
+  prompt, so any authenticated account — including a plain `user`, who
+  cannot upload anything — could spend minutes of CPU and gigabytes of
+  memory per request, repeatedly. Questions over 4000 characters are now
+  refused with a 400 before any of that happens, and the tokenizer is
+  configured with bge-m3's own 8192-position limit at load time, so the
+  bound holds for every caller rather than only this one endpoint.
+
+- **DOCX and XLSX are refused when they declare more than 512 MiB
+  uncompressed.** Both formats are zip archives that the parsers inflate
+  into memory in one go, and the upload limit only ever bounded the
+  *compressed* file — a thousand-to-one ratio is trivial, so a few
+  kilobytes on the wire could become gigabytes of resident memory, fatal on
+  the ARM64 boards this project ships builds for. The check reads the
+  archive's central directory only, so nothing is decompressed to run it.
+  It stops the ordinary bomb, which declares its real size; an archive that
+  lies about its sizes needs the decompression itself to run through a
+  capped reader, and that is left for its own change.
+
+- **A token's claims are now re-checked against the database on every
+  request.** The role and identity were taken from the JWT and believed as
+  written, so deactivating a user, demoting an administrator, or changing a
+  leaked password had *no effect* until the token expired on its own —
+  eight hours, by default. The role is now read from the row, and the
+  lookup already filters `is_active = 1`, so a deactivated account stops
+  working on its next request. Costs one SQLite primary-key lookup per
+  authenticated request. Tokens issued before a password change still
+  survive until expiry; closing that needs a token-version column and is
+  left for its own change.
+
+- **`AUTH__ADMIN_DEFAULT_PASSWORD` no longer overwrites an existing admin
+  password on every start.** It rewrote the stored hash at *every* startup,
+  which meant an installation carrying that variable could never really
+  change its admin password — the value in `.env` silently won again at the
+  next restart, even after the admin had set a new one from the UI. And
+  because the only check was "not empty", `=x` produced a one-character
+  administrator, reinstated at every boot. It now seeds a fresh install
+  only, is validated against the ordinary password policy, and is ignored
+  with a warning once the account exists.
+
+  **Upgrading:** if you relied on that variable to reset the password, use
+  the new `AUTH__ADMIN_RESET_PASSWORD` — it does the same thing on purpose,
+  says so loudly in the log, and should be unset again afterwards.
+
+- **The API no longer answers cross-origin requests from anywhere.** It
+  attached `CorsLayer::permissive()` — `Access-Control-Allow-Origin: *`
+  with every method and header — to a binary that serves its own frontend
+  from its own origin, so the layer permitted everything and protected
+  nothing: any page on the internet could call this API from a visitor's
+  browser and read the answers. There is now no CORS layer at all unless
+  `SERVER__CORS_ORIGINS` names the origins to allow, which is only needed
+  for a dev server on another port.
+
+- **Every response now carries security headers.** A Content Security
+  Policy (`script-src 'self'`, `frame-ancestors 'none'`), `nosniff`, and
+  `Referrer-Policy: same-origin` — none of which were set, on a binary
+  whose entire surface is an administrative UI. The policy admits
+  `'unsafe-inline'` for styles alone, because the upload progress bar sets
+  its width through a style attribute; script-src is not relaxed to buy
+  that.
+
+- **Server errors no longer hand their internals to the caller.** A 5xx
+  returned the `anyhow` chain verbatim — filesystem paths, the Qdrant URL,
+  SQL text, the body of an eullm reply — which is free reconnaissance for
+  anyone who can provoke one. The detail now goes to the log, where it is
+  useful, and the response says only that something broke. Client errors
+  are unchanged: a 4xx still explains what the caller got wrong.
+
+- **CI now runs on pull requests, and checks that the committed frontend
+  bundle matches its source.** The workflow only triggered on pushes to
+  `main`, so an external contributor's code was validated *after* it had
+  already landed — the wrong order, and one that only worked this month
+  because every such pull request was compiled and tested by hand. The
+  bundle check exists for the same reason: `frontend/dist` is committed,
+  so a pull request carries a minified file built on someone else's
+  machine that nobody can review by reading it. CI rebuilds it and fails
+  on any difference. First-time contributors from a fork still need a
+  maintainer to approve the run, which is the correct default and is left
+  alone.
+
 - **Repeated failed logins against one account now earn a growing delay,
   and only a few password verifications run at once.**
   `POST /api/auth/login` accepted unlimited attempts and paid an Argon2id
@@ -101,6 +183,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   address, and a per-IP limit would let one person's typo lock out an
   entire organisation. See the module documentation in
   `src/auth/throttle.rs` for the full reasoning.
+
+- **`cargo audit` is clean: twelve advisories down to zero.** The remaining
+  `quick-xml` copies went with `docx-rs` 0.4.22, `pdf_oxide` 0.3.77 and
+  `calamine` 0.36.1, all of which now use the patched 0.41 — closing
+  RUSTSEC-2026-0194 and RUSTSEC-2026-0195, the quadratic-parse and
+  unbounded-allocation flaws reachable through any DOCX or XLSX a user
+  uploads. `crossbeam-epoch` went to 0.9.21 (RUSTSEC-2026-0204).
+
+  What is left is `rsa` (RUSTSEC-2023-0071, no fix published), which
+  reaches the lockfile through sqlx's MySQL driver — a backend this project
+  does not build, so the crate is never linked into the binary.
+  `.cargo/audit.toml` records that with the reasoning, rather than leaving
+  a permanent red line nobody reads. Seven "unmaintained" advisories remain
+  on transitive crates; none has an action.
 
 - **`h2` updated to 0.4.19** (RUSTSEC-2026-0258: unbounded empty DATA
   frames). It reaches this server through hyper under axum, and axum 0.7

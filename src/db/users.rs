@@ -79,12 +79,25 @@ pub async fn find_by_id(pool: &SqlitePool, user_id: i64) -> Result<Option<UserRo
 /// Crea o aggiorna l'admin di default.
 ///
 /// Behaviour:
-/// - If `AUTH__ADMIN_DEFAULT_PASSWORD` is set, that password is used, both on
-///   creation and on update, so restarting with a new password works.
-/// - If it is unset and the admin does NOT exist, a random password is
-///   generated and logged.
-/// - If it is unset and the admin already exists, nothing is touched.
-pub async fn seed_admin(pool: &SqlitePool, configured_password: Option<&str>) -> Result<()> {
+/// - The admin does not exist yet → created, with `AUTH__ADMIN_DEFAULT_PASSWORD`
+///   if that is set and passes the password policy, otherwise with a random
+///   password printed once to the log.
+/// - The admin already exists → `AUTH__ADMIN_DEFAULT_PASSWORD` is IGNORED, and
+///   a warning says so. It used to overwrite the stored password on every
+///   single start, which meant an installation carrying that variable could
+///   never really change its admin password: the value in `.env` won at the
+///   next restart, silently, even after the admin had set a new one from the
+///   UI. And because the only check was "not empty", `=x` was a one-character
+///   administrator, reinstated at every boot.
+/// - `AUTH__ADMIN_RESET_PASSWORD` overwrites it deliberately, exists for the
+///   one real need the old behaviour served — being locked out — and says
+///   loudly in the log that it did so. Unset it after use, or the next restart
+///   resets the password again.
+pub async fn seed_admin(
+    pool: &SqlitePool,
+    configured_password: Option<&str>,
+    reset_password: Option<&str>,
+) -> Result<()> {
     use crate::auth::password;
 
     let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE username = ?")
@@ -92,7 +105,10 @@ pub async fn seed_admin(pool: &SqlitePool, configured_password: Option<&str>) ->
         .fetch_one(pool)
         .await? > 0;
 
-    if let Some(p) = configured_password.filter(|p| !p.is_empty()) {
+    // Deliberate reset. The only path that may overwrite an existing password.
+    if let Some(p) = reset_password.filter(|p| !p.is_empty()) {
+        password::validate_new_password(p)
+            .map_err(|e| anyhow::anyhow!("AUTH__ADMIN_RESET_PASSWORD: {e}"))?;
         let hash = password::hash(p)?;
         if exists {
             sqlx::query("UPDATE users SET password_hash = ? WHERE username = ?")
@@ -100,19 +116,40 @@ pub async fn seed_admin(pool: &SqlitePool, configured_password: Option<&str>) ->
                 .bind("admin")
                 .execute(pool)
                 .await?;
-            tracing::info!("admin password updated from AUTH__ADMIN_DEFAULT_PASSWORD");
+            tracing::warn!(
+                "admin password RESET from AUTH__ADMIN_RESET_PASSWORD — unset that \
+                 variable, or the next restart will reset it again"
+            );
         } else {
             create(pool, "admin", "admin@rag-engine.local", &hash, Role::Admin).await?;
-            tracing::info!("admin creato con AUTH__ADMIN_DEFAULT_PASSWORD");
+            tracing::info!("admin created with AUTH__ADMIN_RESET_PASSWORD");
         }
         return Ok(());
     }
 
     if exists {
+        if configured_password.is_some_and(|p| !p.is_empty()) {
+            tracing::warn!(
+                "AUTH__ADMIN_DEFAULT_PASSWORD is set but the admin account already \
+                 exists, so it was ignored — it seeds a new installation, it does not \
+                 change an existing password. Use the UI, or AUTH__ADMIN_RESET_PASSWORD \
+                 if you are locked out."
+            );
+        }
         return Ok(());
     }
 
-    // No password configured and no admin yet → generate a random one.
+    // Seeding a fresh installation.
+    if let Some(p) = configured_password.filter(|p| !p.is_empty()) {
+        password::validate_new_password(p)
+            .map_err(|e| anyhow::anyhow!("AUTH__ADMIN_DEFAULT_PASSWORD: {e}"))?;
+        let hash = password::hash(p)?;
+        create(pool, "admin", "admin@rag-engine.local", &hash, Role::Admin).await?;
+        tracing::info!("admin created with AUTH__ADMIN_DEFAULT_PASSWORD");
+        return Ok(());
+    }
+
+    // Nothing configured → generate one and print it once.
     let generated: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(22)
@@ -123,7 +160,7 @@ pub async fn seed_admin(pool: &SqlitePool, configured_password: Option<&str>) ->
     tracing::warn!("  Username: admin");
     tracing::warn!("  Password: {generated}");
     tracing::warn!("SAVE THIS PASSWORD — it will not be shown again!");
-    tracing::warn!("Per impostarne una fissa: AUTH__ADMIN_DEFAULT_PASSWORD=...");
+    tracing::warn!("Per impostarne una fissa alla PRIMA installazione: AUTH__ADMIN_DEFAULT_PASSWORD=...");
     tracing::warn!("========================================");
     let hash = password::hash(&generated)?;
     create(pool, "admin", "admin@rag-engine.local", &hash, Role::Admin).await?;

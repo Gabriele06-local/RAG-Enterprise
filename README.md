@@ -154,7 +154,13 @@ Everything else is optional:
 SERVER__HOST=127.0.0.1           # loopback by default — see "Reaching it from
                                  # another machine" below before changing it
 SERVER__PORT=8000
-AUTH__ADMIN_DEFAULT_PASSWORD=…   # otherwise a random one is generated and logged
+SERVER__CORS_ORIGINS=…           # empty by default, and empty is right in
+                                 # production; set it only for a dev server
+                                 # on another port
+AUTH__ADMIN_DEFAULT_PASSWORD=…   # seeds a NEW install; ignored once the admin
+                                 # exists. Otherwise a random one is logged
+AUTH__ADMIN_RESET_PASSWORD=…     # deliberately overwrites it — for being
+                                 # locked out. Unset it once used
 EULLM__MODEL=qwen3-14b           # only read when you run eullm yourself; when
                                  # the engine starts it, the GGUF path from
                                  # manifest.toml is used instead
