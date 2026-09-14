@@ -15,53 +15,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Fixed
+---
 
-- **A long answer is no longer truncated and then saved as if it were
-  complete.** The HTTP client applied a single 180-second timeout to every
-  request, and in `reqwest` that timeout covers the whole request including
-  the response body — so on the streaming endpoint it was not a liveness
-  check but a cap on how long the model was allowed to talk. With
-  `EULLM__NUM_PREDICT=4096` a 14B model passes three minutes routinely.
-  Past that the connection was dropped mid-sentence, and because a severed
-  stream reached the SSE layer as the same closed channel a finished one
-  does, the half-written text was stored as the assistant's reply, shown
-  with a normal completion event, and — with `use_history` on — replayed to
-  the model on every later turn in the same conversation. The streaming
-  path now bounds *silence* rather than total duration: 30 s to open the
-  connection and 180 s without a single byte from eullm, which still covers
-  the legitimately long gaps (a cold model load, or the swap back into VRAM
-  after `EULLM__UNLOAD_DURING_INGESTION` or an eullm-mode embedding call)
-  while letting a healthy generation run to its end. An interrupted
-  generation is now reported as such: the stream emits an `error` event
-  instead of `done`, the partial text is deliberately not persisted, and
-  the UI marks what did arrive as incomplete. Unary requests (`invoke`,
-  `unload`, `embed`) keep the 180-second total timeout, which is the right
-  shape for them.
+## [0.1.42] - 2026-09-14
 
-- **A `conversation_id` from the request body is now checked against the
-  caller before it is used.** Every read in `db::conversations` filters by
-  `user_id` as well, so a conversation id belonging to someone else could
-  never disclose anything — but the write paths took the id at face value,
-  which let a user file their own messages under another user's
-  conversation and, through the `updated_at` touch that follows every
-  insert, move that conversation to the top of its owner's list. Both
-  `/api/query` and `/api/query/stream` now answer `404 conversation not
-  found` for an id the caller does not own (404 and not 403: whether
-  someone else's conversation exists is not theirs to learn), and
-  `touch_conversation` carries a `user_id` filter of its own.
+### Changed
 
-- **Stale-instance cleanup at startup no longer matches on command lines.**
-  Before spawning eullm the supervisor ran `pkill -f <path to eullm>`,
-  which tests that path as an extended regex against the full command line
-  of every process the user owns — an editor with the file open, a
-  `tail -f` on it, a script that merely names it, all matched and all
-  killed — and, since the path was never escaped, a data directory
-  containing `+` or `(` silently changed what it matched. On Linux it now
-  reads `/proc/<pid>/exe`, the kernel's own answer to what a process is
-  running, and signals only the processes that are genuinely this binary
-  (including one left over from an in-place upgrade, which the kernel
-  reports with a " (deleted)" suffix).
+- **A search result whose payload cannot be read is now logged instead of
+  silently dropped.** Points written by an older schema, or by another tool
+  against the same collection, were discarded by `.ok()?` with no trace —
+  which is what made "the answer ignores a document I know is in there"
+  impossible to explain from the outside. Each dropped point is logged with
+  its id and the parse error, plus a summary line when a search loses any.
 
 ### Performance
 
@@ -90,14 +55,55 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and each piece carries the character count taken when it went in instead
   of being counted a second time on the way out.
 
-### Changed
+### Fixed
 
-- **A search result whose payload cannot be read is now logged instead of
-  silently dropped.** Points written by an older schema, or by another tool
-  against the same collection, were discarded by `.ok()?` with no trace —
-  which is what made "the answer ignores a document I know is in there"
-  impossible to explain from the outside. Each dropped point is logged with
-  its id and the parse error, plus a summary line when a search loses any.
+- **A long answer is no longer truncated and then saved as if it were
+  complete.** The HTTP client applied a single 180-second timeout to every
+  request, and in `reqwest` that timeout covers the whole request including
+  the response body — so on the streaming endpoint it was not a liveness
+  check but a cap on how long the model was allowed to talk. With
+  `EULLM__NUM_PREDICT=4096` a 14B model passes three minutes routinely.
+  Past that the connection was dropped mid-sentence, and because a severed
+  stream reached the SSE layer as the same closed channel a finished one
+  does, the half-written text was stored as the assistant's reply, shown
+  with a normal completion event, and — with `use_history` on — replayed to
+  the model on every later turn in the same conversation. The streaming
+  path now bounds *silence* rather than total duration: 30 s to open the
+  connection and 180 s without a single byte from eullm, which still covers
+  the legitimately long gaps (a cold model load, or the swap back into VRAM
+  after `EULLM__UNLOAD_DURING_INGESTION` or an eullm-mode embedding call)
+  while letting a healthy generation run to its end. An interrupted
+  generation is now reported as such: the stream emits an `error` event
+  instead of `done`, the partial text is deliberately not persisted, and
+  the UI marks what did arrive as incomplete. Unary requests (`invoke`,
+  `unload`, `embed`) keep the 180-second total timeout, which is the right
+  shape for them.
+
+### Security
+
+- **A `conversation_id` from the request body is now checked against the
+  caller before it is used.** Every read in `db::conversations` filters by
+  `user_id` as well, so a conversation id belonging to someone else could
+  never disclose anything — but the write paths took the id at face value,
+  which let a user file their own messages under another user's
+  conversation and, through the `updated_at` touch that follows every
+  insert, move that conversation to the top of its owner's list. Both
+  `/api/query` and `/api/query/stream` now answer `404 conversation not
+  found` for an id the caller does not own (404 and not 403: whether
+  someone else's conversation exists is not theirs to learn), and
+  `touch_conversation` carries a `user_id` filter of its own.
+
+- **Stale-instance cleanup at startup no longer matches on command lines.**
+  Before spawning eullm the supervisor ran `pkill -f <path to eullm>`,
+  which tests that path as an extended regex against the full command line
+  of every process the user owns — an editor with the file open, a
+  `tail -f` on it, a script that merely names it, all matched and all
+  killed — and, since the path was never escaped, a data directory
+  containing `+` or `(` silently changed what it matched. On Linux it now
+  reads `/proc/<pid>/exe`, the kernel's own answer to what a process is
+  running, and signals only the processes that are genuinely this binary
+  (including one left over from an in-place upgrade, which the kernel
+  reports with a " (deleted)" suffix).
 
 ---
 
