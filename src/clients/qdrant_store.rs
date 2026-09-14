@@ -55,7 +55,7 @@ impl QdrantStore {
                     }),
                 )
                 .await?;
-            tracing::info!(collection = %self.collection, "collection Qdrant creata");
+            tracing::info!(collection = %self.collection, "Qdrant collection created");
         }
         self.ensure_document_id_index().await;
         Ok(())
@@ -91,14 +91,14 @@ impl QdrantStore {
             Ok(_) => tracing::debug!(
                 collection = %self.collection,
                 field = DOCUMENT_ID_FIELD,
-                "indice payload Qdrant presente"
+                "Qdrant payload index in place"
             ),
             Err(e) => tracing::warn!(
                 collection = %self.collection,
                 field = DOCUMENT_ID_FIELD,
                 error = %e,
-                "indice payload Qdrant non creato: le cancellazioni per documento \
-                 scansioneranno l'intera collection"
+                "Qdrant payload index not created: per-document deletes will scan \
+                 the whole collection"
             ),
         }
     }
@@ -202,7 +202,7 @@ impl VectorStore for QdrantStore {
                         tracing::warn!(
                             point_id = %id,
                             error = %e,
-                            "Qdrant: payload non deserializzabile, punto escluso dai risultati"
+                            "Qdrant: payload will not deserialize, point excluded from the results"
                         );
                         None
                     }
@@ -213,7 +213,7 @@ impl VectorStore for QdrantStore {
             tracing::warn!(
                 returned,
                 usable = hits.len(),
-                "Qdrant: {} punti su {returned} scartati per payload illeggibile",
+                "Qdrant: dropped {} of {returned} points with unreadable payloads",
                 returned - hits.len()
             );
         }
@@ -231,7 +231,7 @@ impl VectorStore for QdrantStore {
             )
             .await
             .with_context(|| format!("qdrant delete_document {document_id}"))?;
-        tracing::info!(document_id = %document_id, "vettori Qdrant eliminati");
+        tracing::info!(document_id = %document_id, "Qdrant vectors deleted");
         Ok(())
     }
 }

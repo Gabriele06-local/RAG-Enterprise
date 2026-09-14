@@ -629,11 +629,11 @@ function App() {
           if (payload.token !== undefined) {
             appendToken(payload.token)
           } else if (payload.error) {
-            // Generazione interrotta a metà (vedi StreamItem::Failed in
-            // clients/eullm.rs): il backend non salva il testo parziale, così
-            // non torna come risposta al prossimo caricamento. Quello già
-            // ricevuto resta a schermo ma marcato come errore — nasconderlo
-            // farebbe sparire testo che l'utente ha appena visto arrivare.
+            // Generation was cut off (see StreamItem::Failed in
+            // clients/eullm.rs): the backend does not persist the partial
+            // text, so it will not come back as the answer on the next load.
+            // What already arrived stays on screen but marked as an error —
+            // hiding it would make text the user just watched arrive vanish.
             if (assistantPushed) {
               setMessages(prev => {
                 const next = [...prev]
