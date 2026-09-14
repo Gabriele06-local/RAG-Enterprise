@@ -64,7 +64,7 @@ pub async fn upload(
     // holds the single ingestion permit, so a second upload waits here instead
     // of reloading the chat model into VRAM that this one is still embedding
     // in — see IngestionGuard::start.
-    let _ingestion_guard = crate::state::IngestionGuard::start(&state).await;
+    let _ingestion_guard = crate::state::IngestionGuard::start(&state.active_ingestions, &state.ingestion_slot).await;
     let unload_enabled = state.settings.eullm.unload_during_ingestion;
     let ingestion_embedding = state.settings.embeddings.ingestion_embedding;
     let candle_gpu = ingestion_embedding == crate::config::IngestionEmbedding::CandleGpu;
