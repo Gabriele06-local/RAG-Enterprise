@@ -39,6 +39,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `unload`, `embed`) keep the 180-second total timeout, which is the right
   shape for them.
 
+- **A `conversation_id` from the request body is now checked against the
+  caller before it is used.** Every read in `db::conversations` filters by
+  `user_id` as well, so a conversation id belonging to someone else could
+  never disclose anything — but the write paths took the id at face value,
+  which let a user file their own messages under another user's
+  conversation and, through the `updated_at` touch that follows every
+  insert, move that conversation to the top of its owner's list. Both
+  `/api/query` and `/api/query/stream` now answer `404 conversation not
+  found` for an id the caller does not own (404 and not 403: whether
+  someone else's conversation exists is not theirs to learn), and
+  `touch_conversation` carries a `user_id` filter of its own.
+
+- **Stale-instance cleanup at startup no longer matches on command lines.**
+  Before spawning eullm the supervisor ran `pkill -f <path to eullm>`,
+  which tests that path as an extended regex against the full command line
+  of every process the user owns — an editor with the file open, a
+  `tail -f` on it, a script that merely names it, all matched and all
+  killed — and, since the path was never escaped, a data directory
+  containing `+` or `(` silently changed what it matched. On Linux it now
+  reads `/proc/<pid>/exe`, the kernel's own answer to what a process is
+  running, and signals only the processes that are genuinely this binary
+  (including one left over from an in-place upgrade, which the kernel
+  reports with a " (deleted)" suffix).
+
 ---
 
 ## [0.1.41] - 2026-09-14
