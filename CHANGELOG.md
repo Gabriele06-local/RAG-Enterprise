@@ -15,6 +15,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+---
+
+## [0.1.41] - 2026-09-14
+
 ### Changed
 
 - **The server now listens on `127.0.0.1` by default instead of
