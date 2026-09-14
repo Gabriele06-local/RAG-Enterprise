@@ -298,9 +298,16 @@ pub struct StorageSettings {
     #[serde(default = "default_documents_dir")]
     pub documents_dir: String,
     /// Document upload limit (MB). MAX_UPLOAD_SIZE_MB, default 100.
+    /// Validated at startup to 1..=MAX_UPLOAD_MB (see `validate_storage`).
     #[serde(default = "default_max_upload_mb")]
     pub max_upload_mb: u64,
 }
+
+/// Provisional ceiling for `STORAGE__MAX_UPLOAD_MB` (see `validate_storage`).
+/// Deliberately provisional: while upload bodies are buffered in RAM this
+/// limit doubles as memory protection, so it stays conservative; once
+/// uploads stream to disk it can be raised.
+pub const MAX_UPLOAD_MB: u64 = 1024;
 
 /// Radice dati: binari, modelli, storage Qdrant, db SQLite, uploads.
 /// Layout: {dir}/bin/  {dir}/models/  {dir}/storage/  {dir}/db/  {dir}/uploads/
@@ -468,6 +475,8 @@ impl Settings {
 
         validate_auth(&s.auth)?;
 
+        validate_storage(&s.storage)?;
+
         Ok(s)
     }
 }
@@ -583,6 +592,33 @@ pub(crate) fn parse_cors_origins(raw: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+/// Fail-closed validation of the upload limit, run from Settings::load at
+/// startup — the same approach as `validate_auth` above.
+///
+/// `0` is a misconfiguration, not "unlimited": `api::router` turns it into
+/// `DefaultBodyLimit::max(0)`, which rejects every upload with a 413 that
+/// looks like a client problem. (Disabling uploads is already the upload
+/// role check's job.) The `MAX_UPLOAD_MB` ceiling is provisional (see its
+/// own doc comment): while upload bodies are buffered in RAM it doubles as
+/// memory protection, so an absurd value must also fail here rather than
+/// overflow `mb * 1024 * 1024` — panicking in debug, wrapping in release —
+/// on the way into `DefaultBodyLimit`.
+fn validate_storage(storage: &StorageSettings) -> Result<()> {
+    if storage.max_upload_mb == 0 {
+        anyhow::bail!("STORAGE__MAX_UPLOAD_MB must be greater than 0 — 0 rejects every upload.");
+    }
+    if storage.max_upload_mb.checked_mul(1024 * 1024).is_none() {
+        anyhow::bail!("STORAGE__MAX_UPLOAD_MB is too large: its value in bytes overflows u64.");
+    }
+    if storage.max_upload_mb > MAX_UPLOAD_MB {
+        anyhow::bail!(
+            "STORAGE__MAX_UPLOAD_MB must be at most {MAX_UPLOAD_MB} (provisional ceiling while \
+             uploads are buffered in RAM — see MAX_UPLOAD_MB)."
+        );
+    }
+    Ok(())
 }
 
 /// Extracted from Settings::load so it can be tested without touching real
@@ -780,6 +816,43 @@ mod tests {
     fn overflowing_expiry_fails() {
         let err = validate_auth(&auth_with(&"s".repeat(32), u64::MAX)).unwrap_err();
         assert!(err.to_string().contains("AUTH__JWT_EXPIRY_MINUTES"));
+    }
+
+    fn storage_with(max_upload_mb: u64) -> StorageSettings {
+        StorageSettings { documents_dir: "./uploads".to_owned(), max_upload_mb }
+    }
+
+    #[test]
+    fn default_and_sane_upload_limits_pass() {
+        assert!(validate_storage(&storage_with(default_max_upload_mb())).is_ok());
+        assert!(validate_storage(&storage_with(1)).is_ok());
+        assert!(validate_storage(&storage_with(MAX_UPLOAD_MB)).is_ok());
+    }
+
+    /// `0` would turn into `DefaultBodyLimit::max(0)` and reject every
+    /// upload with a 413 — a misconfiguration, not a way to disable
+    /// uploads (the upload role check already does that).
+    #[test]
+    fn zero_upload_limit_fails() {
+        let err = validate_storage(&storage_with(0)).unwrap_err();
+        assert!(err.to_string().contains("STORAGE__MAX_UPLOAD_MB"));
+    }
+
+    /// Provisional ceiling while upload bodies are buffered in RAM; it can
+    /// rise once uploads stream to disk (see MAX_UPLOAD_MB).
+    #[test]
+    fn upload_limit_above_provisional_ceiling_fails() {
+        let err = validate_storage(&storage_with(MAX_UPLOAD_MB + 1)).unwrap_err();
+        assert!(err.to_string().contains("STORAGE__MAX_UPLOAD_MB"));
+    }
+
+    /// Same class of bug as the JWT expiry overflow: an absurd value must
+    /// fail here, not panic in debug or wrap in release on the way into
+    /// `DefaultBodyLimit`.
+    #[test]
+    fn overflowing_upload_limit_fails() {
+        let err = validate_storage(&storage_with(u64::MAX)).unwrap_err();
+        assert!(err.to_string().contains("STORAGE__MAX_UPLOAD_MB"));
     }
 
     /// The default must stay loopback: a regression here silently re-exposes
