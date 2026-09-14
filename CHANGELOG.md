@@ -63,6 +63,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (including one left over from an in-place upgrade, which the kernel
   reports with a " (deleted)" suffix).
 
+### Performance
+
+- **Two uploads at once no longer sabotage each other.** The ingestion
+  window — unload eullm, move bge-m3 onto the GPU, parse/chunk/embed, move
+  it back, reload eullm — was only counted, never serialised: the first
+  upload to finish reloaded the chat model into VRAM while the second was
+  still embedding in it, and the second hit CUDA OOM, fell back to the CPU
+  and finished an order of magnitude slower without reporting anything to
+  anyone. One permit now guards the window, so the second upload waits its
+  turn; the pair takes about as long as before and neither degrades.
+
+- **Qdrant now carries a payload index on `document_id`.** Without one,
+  every `document_id` filter — which is every document deletion — was
+  answered by reading the payload of every point in the collection: at ten
+  thousand documents, removing one meant scanning millions of points to
+  find its few hundred. The index is created on startup for existing
+  collections too, not only for newly created ones, and a Qdrant that
+  refuses it logs a warning rather than blocking startup.
+
+- **The chunker no longer shifts its whole overlap window on every
+  removal.** `Vec::remove(0)` moved every remaining element down a slot
+  each time; with the `" "` separator the window holds 150–200 words and
+  most of them are dropped at each flush, so a 10 MB document spent a few
+  hundred million element moves achieving nothing. It is a `VecDeque` now,
+  and each piece carries the character count taken when it went in instead
+  of being counted a second time on the way out.
+
+### Changed
+
+- **A search result whose payload cannot be read is now logged instead of
+  silently dropped.** Points written by an older schema, or by another tool
+  against the same collection, were discarded by `.ok()?` with no trace —
+  which is what made "the answer ignores a document I know is in there"
+  impossible to explain from the outside. Each dropped point is logged with
+  its id and the parse error, plus a summary line when a search loses any.
+
 ---
 
 ## [0.1.41] - 2026-09-14

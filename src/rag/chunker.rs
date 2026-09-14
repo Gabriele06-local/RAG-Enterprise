@@ -8,6 +8,8 @@
 //! Key invariant: the splitter FILLS chunks up to chunk_size by accumulating small
 //! pieces before flushing. Breaking at every separator would produce tiny chunks
 //! (~5 chars per "word") — this was a known bug in the old port (~285 chars vs 600).
+use std::collections::VecDeque;
+
 
 pub const CHUNK_SIZE: usize = 1000;
 pub const CHUNK_OVERLAP: usize = 100;
@@ -157,15 +159,34 @@ fn split_recursive(root: &str, text: &str, separators: &[&str]) -> Vec<Chunk> {
 fn merge_small(root: &str, pieces: &[&str], sep: &str) -> Vec<Chunk> {
     let sep_len = clen(sep);
     let mut docs: Vec<Chunk> = Vec::new();
-    let mut window: Vec<&str> = Vec::new();
-    let mut total: usize = 0; // clen(window.join(sep))
+    // A deque, not a Vec: the window is filled at the back and drained from
+    // the front, and `Vec::remove(0)` shifts every remaining element down one
+    // slot each time. With `sep == " "` the window holds 150-200 words and
+    // the overlap loop drops most of them at every flush, so a 10 MB document
+    // used to spend a few hundred million element moves doing nothing.
+    //
+    // Each entry carries its own char length as well. The overlap loop needs
+    // the length of the piece it is dropping, and used to get it by counting
+    // that piece's characters a second time — the same count already done
+    // when the piece went in.
+    let mut window: VecDeque<(&str, usize)> = VecDeque::new();
+    let mut total: usize = 0; // clen of the window joined by sep
 
-    let flush = |window: &[&str]| -> Chunk {
-        let text = window.join(sep);
-        let start = offset_of(root, window[0]);
-        let last = window[window.len() - 1];
-        let end = offset_of(root, last) + last.len();
-        Chunk { text, start_byte: start, end_byte: end }
+    let flush = |window: &VecDeque<(&str, usize)>| -> Chunk {
+        let mut text = String::new();
+        for (i, (piece, _)) in window.iter().enumerate() {
+            if i > 0 {
+                text.push_str(sep);
+            }
+            text.push_str(piece);
+        }
+        let first = window.front().expect("flush is only called on a non-empty window").0;
+        let last = window.back().expect("flush is only called on a non-empty window").0;
+        Chunk {
+            text,
+            start_byte: offset_of(root, first),
+            end_byte: offset_of(root, last) + last.len(),
+        }
     };
 
     for &piece in pieces {
@@ -178,11 +199,8 @@ fn merge_small(root: &str, pieces: &[&str], sep: &str) -> Vec<Chunk> {
             // Shrink window toward overlap.
             // Keep removing from the front while:
             //   total > CHUNK_OVERLAP  OR  (total+plen+sep > CHUNK_SIZE AND total > 0)
-            loop {
-                if window.is_empty() {
-                    break;
-                }
-                let sep_if_nonempty = sep_len; // window non-empty (checked above)
+            while let Some(&(_, front_len)) = window.front() {
+                let sep_if_nonempty = sep_len; // window non-empty (front() is Some)
                 let above_overlap = total > CHUNK_OVERLAP;
                 let still_exceeds =
                     total + plen + sep_if_nonempty > CHUNK_SIZE && total > 0;
@@ -191,14 +209,13 @@ fn merge_small(root: &str, pieces: &[&str], sep: &str) -> Vec<Chunk> {
                 }
                 // Remove the oldest piece; also remove the separator that followed it
                 // if there are more pieces remaining.
-                let removed =
-                    clen(window[0]) + if window.len() > 1 { sep_len } else { 0 };
+                let removed = front_len + if window.len() > 1 { sep_len } else { 0 };
                 total = total.saturating_sub(removed);
-                window.remove(0);
+                window.pop_front();
             }
         }
 
-        window.push(piece);
+        window.push_back((piece, plen));
         // Separator is counted only between adjacent pieces (len > 1 after push).
         total += plen + if window.len() > 1 { sep_len } else { 0 };
     }
@@ -474,6 +491,33 @@ mod tests {
             );
         }
         assert_spans_correct(text, &chunks);
+    }
+
+    /// The path the window rewrite touched: enough pieces that the overlap
+    /// loop runs hundreds of times. Asserts what merge_small actually
+    /// promises — every chunk within CHUNK_SIZE, every span quoting the
+    /// source exactly, and consecutive chunks genuinely overlapping.
+    #[test]
+    fn many_flushes_keep_sizes_spans_and_overlap_consistent() {
+        let text = (0..5000).map(|i| format!("word{i}")).collect::<Vec<_>>().join(" ");
+        let chunks = split_text(&text);
+        assert!(chunks.len() > 30, "expected many flushes, got {}", chunks.len());
+
+        for (i, c) in chunks.iter().enumerate() {
+            assert!(clen(&c.text) <= CHUNK_SIZE, "chunk {i} is {} chars", clen(&c.text));
+            assert!(c.start_byte < c.end_byte, "chunk {i} has an empty span");
+            assert!(c.end_byte <= text.len(), "chunk {i} runs past the end");
+            // Single spaces throughout, so nothing collapses: the span must
+            // quote the source byte for byte.
+            assert_eq!(&text[c.start_byte..c.end_byte], c.text, "chunk {i} span mismatch");
+        }
+        for (i, pair) in chunks.windows(2).enumerate() {
+            assert!(
+                pair[1].start_byte < pair[0].end_byte,
+                "chunks {i} and {} do not overlap",
+                i + 1
+            );
+        }
     }
 
     #[test]

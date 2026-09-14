@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use anyhow::Context;
 use sqlx::SqlitePool;
 
@@ -58,23 +59,51 @@ pub struct AppState {
     /// auth::throttle for why it throttles by username and total concurrency
     /// rather than by client IP.
     pub login_throttle: Arc<LoginThrottle>,
+    /// One permit: the ingestion window (unload → embed → reload) runs one at
+    /// a time. See IngestionGuard::start for what happens when it does not.
+    pub ingestion_slot: Arc<Semaphore>,
 }
 
-/// RAII guard: increments active_ingestions on creation and ALWAYS decrements
-/// on Drop, including on the error and early-return paths in upload(), so no
-/// exit point has to remember to do it.
-pub struct IngestionGuard(Arc<AtomicUsize>);
+/// RAII guard: holds the one ingestion permit and keeps active_ingestions
+/// above zero for as long as it lives, ALWAYS releasing both on Drop —
+/// including on the error and early-return paths in upload(), so no exit
+/// point has to remember to do it.
+pub struct IngestionGuard {
+    counter: Arc<AtomicUsize>,
+    /// Held, never read. Dropping it is what lets the next upload in.
+    _permit: OwnedSemaphorePermit,
+}
 
 impl IngestionGuard {
-    pub fn start(counter: &Arc<AtomicUsize>) -> Self {
-        counter.fetch_add(1, Ordering::SeqCst);
-        Self(counter.clone())
+    /// Waits for the ingestion slot, then claims it.
+    ///
+    /// The window it guards is unload eullm → move bge-m3 onto the GPU →
+    /// parse, chunk, embed → move it back → reload eullm, and running two of
+    /// those at once breaks in a way that looks like nothing at all: upload A
+    /// finishes and reloads the chat model into VRAM while upload B is still
+    /// embedding on the GPU, B hits CUDA OOM, falls back to the CPU and
+    /// finishes an order of magnitude slower, having reported no error to
+    /// anyone. Serialised, the two uploads take about as long as they did
+    /// before and neither degrades.
+    ///
+    /// The second upload does wait here with its request body already in
+    /// hand — the trade is a queued HTTP request against two ingestions
+    /// fighting over the same card, and the queue is the better half of it.
+    pub async fn start(state: &AppState) -> Self {
+        let permit = state
+            .ingestion_slot
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the ingestion semaphore is never closed");
+        state.active_ingestions.fetch_add(1, Ordering::SeqCst);
+        Self { counter: state.active_ingestions.clone(), _permit: permit }
     }
 }
 
 impl Drop for IngestionGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        self.counter.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -100,6 +129,7 @@ impl AppState {
             live_bench,
             extensions: Arc::new(extensions),
             login_throttle: Arc::new(LoginThrottle::new()),
+            ingestion_slot: Arc::new(Semaphore::new(1)),
         }
     }
 
