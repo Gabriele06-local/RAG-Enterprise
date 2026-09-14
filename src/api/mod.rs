@@ -53,7 +53,7 @@ pub fn router(state: AppState, pro_router: Option<Router<AppState>>) -> Router {
     // to the upload route alone. The others (list/delete/download, all JSON or
     // bodyless) keep the default. The limit mirrors the Python
     // MAX_UPLOAD_SIZE_MB, default 100MB.
-    let max_upload_bytes = (state.settings.storage.max_upload_mb * 1024 * 1024) as usize;
+    let max_upload_bytes = state.settings.storage.max_upload_bytes() as usize;
     let upload_route = Router::new()
         .route("/api/documents/upload", post(documents::upload))
         .layer(DefaultBodyLimit::max(max_upload_bytes));
