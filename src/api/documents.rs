@@ -548,6 +548,19 @@ where
         }
         hasher.update(bytes);
     }
+    // `tokio::fs::File` dispatches writes to a blocking pool and `drop` does
+    // not wait for them: without this flush the function could return while
+    // the last chunks are still in flight, and the parser would extract text
+    // from a truncated file. Flush errors take the same path as write
+    // errors. (Flush gets the bytes to the OS, which is all the parser —
+    // reading back through the page cache — needs.)
+    if let Err(e) = out.flush().await {
+        drop(out);
+        let _ = std::fs::remove_file(tmp_path);
+        return Err(ReceiveError::Write(anyhow::anyhow!(
+            "flush temp upload file: {e}"
+        )));
+    }
     drop(out);
     Ok((total, format!("{:x}", hasher.finalize())))
 }
