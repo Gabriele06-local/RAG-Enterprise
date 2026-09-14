@@ -82,6 +82,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- **A published placeholder is no longer accepted as `AUTH__JWT_SECRET`.**
+  The `.env.example` shipped in every release tarball carried
+  `change-this-to-a-long-random-string` uncommented — 35 characters, so it
+  cleared the 32-character rule added in 0.1.40 and the server started
+  normally. An operator who copied the template, which is what the template
+  tells them to do, was signing session tokens with a key published on
+  GitHub: anyone could forge a token for user 1, the seeded administrator,
+  and the database re-check added in this same release would then look that
+  row up and hand back its real admin role.
+
+  Startup now refuses every value this project has ever printed in a
+  template or a document, whatever its length, and the shipped template
+  ships empty.
+
+  **Upgrading:** an installation still running on the template value will
+  refuse to start until a real secret is set (`openssl rand -hex 32`). That
+  is deliberate — it was forgeable — but check `.env` before rolling this
+  out. Replacing the secret logs everyone out; if it was the placeholder,
+  that is the point.
+
 - **A question now has a maximum length, and the embedder truncates
   regardless.** The only limit was axum's 2 MB default body: a question
   that size was tokenised whole, embedded on the CPU, and pasted into the
