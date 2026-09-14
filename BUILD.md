@@ -297,7 +297,7 @@ and can be set through the environment or a `.env` file:
 SERVER__HOST=127.0.0.1   # loopback by default; see the README before exposing
 SERVER__PORT=8000
 DATABASE__URL=sqlite://rag_users.db
-AUTH__JWT_SECRET=change_this_secret
+AUTH__JWT_SECRET=              # openssl rand -hex 32
 AUTH__ADMIN_DEFAULT_PASSWORD=change_this_password
 QDRANT__URL=http://localhost:6333
 QDRANT__COLLECTION=rag_documents

@@ -484,10 +484,33 @@ impl Settings {
 /// Extracted as a free function so it can be tested without touching real
 /// environment variables, like `validate_ingestion_embedding` below.
 fn validate_auth(auth: &AuthSettings) -> Result<()> {
+    // A published constant is not a secret, whatever its length. Every value
+    // this project has ever printed in a template or a document is listed in
+    // PUBLISHED_JWT_PLACEHOLDERS and refused outright — the shipped
+    // `.env.example` carried a 35-character one, which cleared the length
+    // check below and therefore started the server with an HMAC key anybody
+    // could read off GitHub. From there a forged token for user 1 (the seeded
+    // admin) is trivial, and the database re-check in auth::extractor makes it
+    // worse rather than better: it looks the row up and hands back that user's
+    // real role.
+    //
+    // Checked before the length rule so the error names the actual problem.
+    let candidate = auth.jwt_secret.trim();
+    if PUBLISHED_JWT_PLACEHOLDERS
+        .iter()
+        .any(|p| candidate.eq_ignore_ascii_case(p))
+    {
+        anyhow::bail!(
+            "AUTH__JWT_SECRET is still the placeholder from the configuration template. \
+             That value is published with every release, so it is public knowledge and \
+             anyone could forge an administrator session with it. Generate a real one \
+             with `openssl rand -hex 32`."
+        );
+    }
+
     // HMAC-SHA256 takes any key length, so a weak secret is never rejected
     // downstream — it must be rejected here. 32 bytes = 256 bits, the same
-    // strength as the hash itself; `.env.example` already suggests
-    // `openssl rand -hex 32`, which yields exactly that.
+    // strength as the hash itself; `openssl rand -hex 32` yields exactly that.
     if auth.jwt_secret.len() < 32 {
         anyhow::bail!(
             "AUTH__JWT_SECRET must be at least 32 characters (256 bits) — generate one with \
@@ -505,6 +528,23 @@ fn validate_auth(auth: &AuthSettings) -> Result<()> {
     }
     Ok(())
 }
+
+/// Every `AUTH__JWT_SECRET` value this project has ever shipped in a template
+/// or printed in its documentation.
+///
+/// They are refused regardless of length, because length was never what made
+/// them unusable: they are public. Keeping the historical ones here — not
+/// only whatever the current template says — is the point, since the
+/// installations actually at risk are the ones that copied an older template
+/// and have been running on it since.
+///
+/// Add to this list, never replace it, if a placeholder ever changes again.
+const PUBLISHED_JWT_PLACEHOLDERS: &[&str] = &[
+    // Shipped uncommented in .env.example up to and including v0.1.41.
+    "change-this-to-a-long-random-string",
+    // BUILD.md's runtime-configuration example.
+    "change_this_secret",
+];
 
 /// True when `SERVER__HOST` keeps the server reachable only from this machine.
 ///
@@ -689,6 +729,45 @@ mod tests {
                 "secret={secret:?}"
             );
         }
+    }
+
+    /// The value that shipped in every tarball. It is 35 characters, so the
+    /// length rule alone let it through — and being published is exactly
+    /// what makes it unusable.
+    #[test]
+    fn the_shipped_placeholder_is_refused_despite_being_long_enough() {
+        let placeholder = "change-this-to-a-long-random-string";
+        assert!(placeholder.len() >= 32, "the point of this test is that it is long enough");
+        let err = validate_auth(&auth_with(placeholder, 480)).unwrap_err();
+        assert!(err.to_string().contains("placeholder"), "err={err}");
+    }
+
+    #[test]
+    fn every_published_placeholder_is_refused() {
+        for p in PUBLISHED_JWT_PLACEHOLDERS {
+            assert!(validate_auth(&auth_with(p, 480)).is_err(), "placeholder={p:?}");
+        }
+    }
+
+    /// Copied with a stray newline, or with the case changed, is still the
+    /// same public value.
+    #[test]
+    fn placeholders_are_refused_despite_whitespace_or_case() {
+        for variant in [
+            "  change-this-to-a-long-random-string  ",
+            "CHANGE-THIS-TO-A-LONG-RANDOM-STRING",
+            "Change-This-To-A-Long-Random-String\n",
+        ] {
+            assert!(validate_auth(&auth_with(variant, 480)).is_err(), "variant={variant:?}");
+        }
+    }
+
+    /// A real generated secret must not be caught by the placeholder rule.
+    #[test]
+    fn a_generated_secret_still_passes() {
+        // 64 hex characters, the shape `openssl rand -hex 32` produces.
+        let generated = "9f2c41b0e7a85d3614fa0c9b2e7d58a34c1f6b0982e5d7a14c3b8f60d2e9a715";
+        assert!(validate_auth(&auth_with(generated, 480)).is_ok());
     }
 
     #[test]

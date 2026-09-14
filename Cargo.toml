@@ -1,6 +1,6 @@
 [package]
 name = "i3k-rag-engine"
-version = "0.1.40"
+version = "0.1.41"
 edition = "2021"
 description = "i3k RAG Engine — self-hosted document intelligence, fully local"
 license = "AGPL-3.0-only"
