@@ -17,6 +17,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+
+- **Restore refuses non-regular tar entries, not just escaping paths.**
+  `unpack_tar_gz` checked each entry's path against traversal but never
+  its type: a symlink or hard link with an innocent path still
+  materialised an arbitrary target on unpack, and a restored symlink
+  could redirect a later write outside the destination. Only regular
+  files and directories are now unpacked — everything this project's
+  own archives ever contain.
 - **Uploads stream to disk instead of being buffered in RAM.**
   `process_upload` used to load the entire body into a `Vec<u8>` (plus
   a transient copy) before hashing and writing it, so a few concurrent
@@ -28,6 +36,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   than after the whole body arrived. The `DefaultBodyLimit` stays as a
   backstop; the parser interface is unchanged, and a partial temp file is
   removed on every error path.
+
 
 ---
 
