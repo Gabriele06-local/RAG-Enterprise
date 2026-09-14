@@ -867,11 +867,12 @@ pub async fn provision_and_start_qdrant(
     );
 
     // Directory layout
-    for subdir in &["bin", "models", "storage/qdrant", "db", "uploads", "backups"] {
+    for subdir in &["bin", "models", "storage/qdrant", "db", "uploads", "backups", "tmp"] {
         tokio::fs::create_dir_all(data_dir.join(subdir))
             .await
             .with_context(|| format!("mkdir {}/{subdir}", data_dir.display()))?;
     }
+    sweep_upload_staging(&data_dir.join("tmp")).await;
 
     // Disk-space pre-check
     check_disk_space(&selected, &data_dir)?;
@@ -1972,6 +1973,37 @@ fn find_by_name(manifest: &Manifest, name: &str, data_dir: &Path) -> Option<Path
         .find(|c| c.name == name)
         .map(|c| resolve_dest(&c.dest, data_dir))
         .filter(|p| p.exists()) // only start it if the file is actually there
+}
+
+/// Removes whatever is left in the upload staging directory.
+///
+/// Uploads are staged there while they are parsed (api::documents), and the
+/// handler's RAII guard removes each file on every exit path — but not when
+/// the process dies mid-upload. Staging used to live in `std::env::temp_dir()`,
+/// where the operating system eventually swept orphans up; under the data
+/// directory nothing does, so this would grow without bound one crash at a
+/// time.
+///
+/// Safe precisely because of WHEN it runs: at startup, before the server
+/// accepts anything, no upload can be in flight, so everything present is by
+/// definition an orphan. Best-effort — a file that will not delete is logged
+/// and skipped rather than blocking a start.
+async fn sweep_upload_staging(dir: &Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else { return };
+    let mut removed = 0usize;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        match tokio::fs::remove_file(entry.path()).await {
+            Ok(()) => removed += 1,
+            Err(e) => tracing::warn!(
+                path = %entry.path().display(),
+                error = %e,
+                "upload staging: leftover file could not be removed"
+            ),
+        }
+    }
+    if removed > 0 {
+        tracing::info!(count = removed, "upload staging: removed leftovers from a previous run");
+    }
 }
 
 /// Kills any stale instance of `bin` still running. Used before spawn_eullm

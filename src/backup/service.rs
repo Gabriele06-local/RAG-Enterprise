@@ -628,14 +628,25 @@ fn quote_ident(name: &str) -> String {
 }
 
 /// List backup archives in the backup directory (*.tar.gz), sorted newest first.
-pub fn list_backups(backup_dir: &str) -> Vec<String> {
-    let dir = Path::new(backup_dir);
-    let Ok(entries) = std::fs::read_dir(dir) else { return vec![] };
-    let mut names: Vec<_> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.ends_with(".tar.gz"))
-        .collect();
+///
+/// Async because it is called straight from an axum handler: a synchronous
+/// read_dir there blocks the executor thread for as long as the directory
+/// takes to walk, which on a network mount or a directory holding hundreds
+/// of archives is long enough to stall every other request sharing that
+/// worker. An unreadable directory still answers with an empty list, as
+/// before — a missing backup dir is the normal state before the first
+/// backup, not an error worth surfacing.
+pub async fn list_backups(backup_dir: &str) -> Vec<String> {
+    let Ok(mut entries) = tokio::fs::read_dir(Path::new(backup_dir)).await else {
+        return vec![];
+    };
+    let mut names = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".tar.gz") {
+            names.push(name);
+        }
+    }
     names.sort_by(|a, b| b.cmp(a)); // newest first (lexicographic on timestamp)
     names
 }
