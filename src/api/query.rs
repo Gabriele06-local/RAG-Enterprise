@@ -245,6 +245,30 @@ async fn build_history_pairs(
     Ok(pairs)
 }
 
+/// Rejects a `conversation_id` the caller does not own, before any work is
+/// done on the request.
+///
+/// The id arrives in the request body, so it is the client's word for which
+/// conversation this is. Reads have always been safe — every statement in
+/// db::conversations filters by user_id too — but the write paths below file
+/// the question and the answer under whatever id came in, and inserting under
+/// someone else's conversation bumps it to the top of their list. `None` (no
+/// conversation) is legitimate and passes through.
+async fn check_conversation_owned(
+    state: &AppState,
+    conv_id: Option<&str>,
+    user_id: i64,
+) -> Result<(), Response> {
+    let Some(cid) = conv_id else { return Ok(()) };
+    match db::conversations::is_owned_by(&state.db, cid, user_id).await {
+        // 404, not 403: whether someone else's conversation exists is not
+        // something to confirm to this user.
+        Ok(true) => Ok(()),
+        Ok(false) => Err(err(StatusCode::NOT_FOUND, "conversation not found")),
+        Err(e) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, e)),
+    }
+}
+
 // ── POST /api/query ───────────────────────────────────────────────────────────
 
 pub async fn query(
@@ -259,6 +283,9 @@ pub async fn query(
         return err(StatusCode::BAD_REQUEST, msg);
     }
     let conv_id = req.conversation_id.as_deref();
+    if let Err(resp) = check_conversation_owned(&state, conv_id, claims.user_id).await {
+        return resp;
+    }
     // _timings: not instrumented — the frontend uses /api/query/stream (see
     // query_stream), which is where --bench-live records real queries.
     let (full_prompt, sources, _timings) =
@@ -337,6 +364,9 @@ pub async fn query_stream(
         return err(StatusCode::BAD_REQUEST, msg);
     }
     let conv_id = req.conversation_id.as_deref();
+    if let Err(resp) = check_conversation_owned(&state, conv_id, claims.user_id).await {
+        return resp;
+    }
     // Run setup synchronously before opening the SSE stream so we can return
     // a proper HTTP error if embed/search fails.
     let (full_prompt, sources, timings) =

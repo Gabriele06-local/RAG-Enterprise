@@ -1974,9 +1974,74 @@ fn find_by_name(manifest: &Manifest, name: &str, data_dir: &Path) -> Option<Path
         .filter(|p| p.exists()) // only start it if the file is actually there
 }
 
-/// Kills any stale instances identified by the binary's path. Used before
-/// spawn_eullm to guarantee that only our instance, with our model, is
-/// listening. Best-effort: errors are ignored.
+/// Kills any stale instance of `bin` still running. Used before spawn_eullm
+/// to guarantee that only our instance, with our model, is listening.
+/// Best-effort: anything that fails is ignored.
+///
+/// Matched on the executable a process is ACTUALLY running, which is what
+/// `/proc/<pid>/exe` reports and what the kernel itself considers that
+/// process to be. The previous implementation ran `pkill -f <path>`, which
+/// matches the path as an extended regex against the whole command line of
+/// every process this user owns — an editor with the file open, a `tail -f`
+/// on its log, a packaging script that names it, all matched, all killed.
+/// The path was not escaped as a regex either, so a data directory
+/// containing `+`, `(` or `.` quietly changed what it matched. Reading the
+/// exe link has neither problem: a process either IS that binary or it is
+/// not.
+#[cfg(target_os = "linux")]
+async fn kill_stale_process(bin: &Path) {
+    let target = tokio::fs::canonicalize(bin)
+        .await
+        .unwrap_or_else(|_| bin.to_path_buf());
+    let me = std::process::id();
+
+    let Ok(mut entries) = tokio::fs::read_dir("/proc").await else {
+        tracing::debug!("kill_stale_process: /proc unreadable, skipping");
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            continue; // not a pid directory
+        };
+        if pid == me {
+            continue;
+        }
+        // Another user's process refuses the readlink exactly as it would
+        // refuse the signal: nothing to do about it, nothing to report.
+        let Ok(exe) = tokio::fs::read_link(format!("/proc/{pid}/exe")).await else {
+            continue;
+        };
+        if !same_executable(&exe, &target) {
+            continue;
+        }
+        tracing::info!(pid, bin = %target.display(), "killing stale instance");
+        // SIGTERM, the same signal pkill sent by default.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    }
+    // Brief pause so the kernel can release the port.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+}
+
+/// True when `exe` — a `/proc/<pid>/exe` link — names `target`.
+///
+/// The kernel appends " (deleted)" once the file has been replaced since the
+/// process started, which is precisely what an upgrade does: the instance
+/// left over from the previous version is the one most worth killing, so the
+/// suffix is stripped rather than read as a different path.
+#[cfg(target_os = "linux")]
+fn same_executable(exe: &Path, target: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let raw = exe.as_os_str().as_bytes();
+    let trimmed = raw.strip_suffix(b" (deleted)").unwrap_or(raw);
+    Path::new(std::ffi::OsStr::from_bytes(trimmed)) == target
+}
+
+/// Nothing here reads a command line, so there is no way to narrow it the way
+/// the Linux version does: `/proc` is Linux's, and the portable tools all
+/// match on text. macOS keeps the old `pkill -f` with its imprecision
+/// documented above; on Windows `pkill` does not exist and this has always
+/// been a silent no-op.
+#[cfg(not(target_os = "linux"))]
 async fn kill_stale_process(bin: &Path) {
     let bin_str = bin.display().to_string();
     tracing::debug!("kill_stale_process: pkill -f {bin_str}");
@@ -2640,5 +2705,38 @@ fn fmt_eta(secs: u64) -> String {
         format!("{}m{:02}s", secs / 60, secs % 60)
     } else {
         format!("{secs}s")
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod stale_process_tests {
+    use super::*;
+
+    #[test]
+    fn exe_link_matches_its_own_path() {
+        assert!(same_executable(
+            Path::new("/opt/rag/bin/eullm"),
+            Path::new("/opt/rag/bin/eullm")
+        ));
+    }
+
+    #[test]
+    fn exe_link_still_matches_after_the_binary_was_replaced() {
+        // What an in-place upgrade leaves behind, and the case this function
+        // exists for: the old process is still running the old inode.
+        assert!(same_executable(
+            Path::new("/opt/rag/bin/eullm (deleted)"),
+            Path::new("/opt/rag/bin/eullm")
+        ));
+    }
+
+    #[test]
+    fn a_different_binary_does_not_match() {
+        assert!(!same_executable(Path::new("/usr/bin/tail"), Path::new("/opt/rag/bin/eullm")));
+        // The old pkill -f matched this one: same name, different install.
+        assert!(!same_executable(
+            Path::new("/home/someone/other/bin/eullm"),
+            Path::new("/opt/rag/bin/eullm")
+        ));
     }
 }
