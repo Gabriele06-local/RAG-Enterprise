@@ -15,6 +15,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Startup now refuses a misconfigured `STORAGE__MAX_UPLOAD_MB`.** `0`
+  used to turn into `DefaultBodyLimit::max(0)` and reject every upload
+  with a misleading `413`; values above the new provisional ceiling of
+  `1024`, and values whose byte count overflows `u64`, are rejected too —
+  all fail fast in `Settings::load`, following the existing
+  `validate_auth` pattern. The ceiling is deliberately provisional:
+  while upload bodies are buffered in RAM it doubles as memory
+  protection, and it can rise once uploads stream to disk.
+
 ---
 
 ## [0.1.41] - 2026-09-14
