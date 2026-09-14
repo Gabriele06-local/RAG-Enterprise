@@ -15,6 +15,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A long answer is no longer truncated and then saved as if it were
+  complete.** The HTTP client applied a single 180-second timeout to every
+  request, and in `reqwest` that timeout covers the whole request including
+  the response body — so on the streaming endpoint it was not a liveness
+  check but a cap on how long the model was allowed to talk. With
+  `EULLM__NUM_PREDICT=4096` a 14B model passes three minutes routinely.
+  Past that the connection was dropped mid-sentence, and because a severed
+  stream reached the SSE layer as the same closed channel a finished one
+  does, the half-written text was stored as the assistant's reply, shown
+  with a normal completion event, and — with `use_history` on — replayed to
+  the model on every later turn in the same conversation. The streaming
+  path now bounds *silence* rather than total duration: 30 s to open the
+  connection and 180 s without a single byte from eullm, which still covers
+  the legitimately long gaps (a cold model load, or the swap back into VRAM
+  after `EULLM__UNLOAD_DURING_INGESTION` or an eullm-mode embedding call)
+  while letting a healthy generation run to its end. An interrupted
+  generation is now reported as such: the stream emits an `error` event
+  instead of `done`, the partial text is deliberately not persisted, and
+  the UI marks what did arrive as incomplete. Unary requests (`invoke`,
+  `unload`, `embed`) keep the 180-second total timeout, which is the right
+  shape for them.
+
 ---
 
 ## [0.1.41] - 2026-09-14

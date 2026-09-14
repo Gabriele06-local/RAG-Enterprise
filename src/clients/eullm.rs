@@ -34,7 +34,27 @@ fn think_re() -> &'static Regex {
 }
 
 const NO_THINK: &str = "<think>\n</think>\n";
+
+/// Total budget for a whole unary request — invoke(), unload(), embed_texts().
+/// These answer in one shot, so a request still open after this long is a
+/// request that is not coming back.
 const HTTP_TIMEOUT_SECS: u64 = 180;
+
+/// Streaming gets no total budget at all, deliberately. `reqwest`'s
+/// `timeout()` covers the WHOLE request, response body included, so on a
+/// stream it is not a liveness check but a cap on how long the model is
+/// allowed to talk: with num_predict=4096 a 14B model routinely runs past
+/// three minutes, and the cap then cuts a healthy answer off mid-sentence.
+/// What gets bounded instead is silence — how long the connection may take
+/// to open, and how long eullm may send nothing at all before we call it
+/// dead. Tokens arrive every few hundred milliseconds once generation is
+/// under way, so the gaps this second window actually has to cover are the
+/// legitimately long ones: a cold model load, or the swap back into VRAM
+/// after `unload_during_ingestion` or an eullm-mode embedding call. It is
+/// the same 180s that used to bound the entire answer — now it bounds a
+/// single gap in it.
+const STREAM_CONNECT_TIMEOUT_SECS: u64 = 30;
+const STREAM_IDLE_TIMEOUT_SECS: u64 = 180;
 
 // Repetition-detection parameters.
 const REP_CHECK_AFTER: usize = 80;   // start checking after this many tokens
@@ -93,10 +113,33 @@ struct EmbedResponse {
     embeddings: Vec<Vec<f32>>,
 }
 
+/// What [`EullmClient::invoke_stream`] puts on the channel.
+///
+/// A bare `String` cannot express the difference between "the model stopped
+/// because it had finished" and "the connection died half a sentence in":
+/// both reach the consumer the same way, as a sender that went away. The
+/// consumer needs that difference — text that was cut off must not be stored
+/// as the assistant's reply, or every later turn that replays the
+/// conversation inherits the truncation as if the model had meant it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamItem {
+    /// One piece of generated text, in order.
+    Token(String),
+    /// Generation ended early: whatever arrived before this is incomplete.
+    /// Always the last item on the channel. The variant carries nothing on
+    /// purpose — the cause is logged server-side and returned as the `Err`
+    /// from `invoke_stream`, so no internal detail can reach a client
+    /// through the value itself.
+    Failed,
+}
+
 // ── Client ────────────────────────────────────────────────────────────────────
 
 pub struct EullmClient {
     http: Client,
+    /// Separate client for the streaming path: same requests, different
+    /// timeout shape. See STREAM_IDLE_TIMEOUT_SECS.
+    http_stream: Client,
     base_url: String,
     model: String,
     num_ctx: u32,
@@ -120,7 +163,22 @@ impl EullmClient {
             .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
             .build()
             .expect("reqwest Client build");
-        Self { http, base_url, model, num_ctx, num_predict, repeat_penalty, repeat_last_n, keep_alive }
+        let http_stream = Client::builder()
+            .connect_timeout(Duration::from_secs(STREAM_CONNECT_TIMEOUT_SECS))
+            .read_timeout(Duration::from_secs(STREAM_IDLE_TIMEOUT_SECS))
+            .build()
+            .expect("reqwest streaming Client build");
+        Self {
+            http,
+            http_stream,
+            base_url,
+            model,
+            num_ctx,
+            num_predict,
+            repeat_penalty,
+            repeat_last_n,
+            keep_alive,
+        }
     }
 
     /// The configured model name — e.g. for a cache key that must miss
@@ -258,18 +316,43 @@ impl EullmClient {
 
     // ── Streaming ─────────────────────────────────────────────────────────────
 
-    /// Streams tokens from eullm and sends each one to `tx`.
+    /// Streams tokens from eullm, sending each one to `tx` as
+    /// [`StreamItem::Token`].
     ///
-    /// Stops on: `done` flag, closed receiver, or repetition detected.
+    /// Ends cleanly on: `done` flag, closed receiver, or repetition detected.
+    /// Ends badly on anything else — and when it does, it puts a final
+    /// [`StreamItem::Failed`] on the channel before returning the error, so
+    /// the consumer can tell a finished answer from a severed one instead of
+    /// inferring "finished" from the sender going away.
+    ///
     /// Intended to be spawned: `tokio::spawn(async move { client.invoke_stream(text, tx).await })`.
     pub async fn invoke_stream(
         &self,
         user_text: &str,
-        tx: mpsc::Sender<String>,
+        tx: mpsc::Sender<StreamItem>,
+    ) -> Result<()> {
+        match self.stream_inner(user_text, &tx).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Say so while the channel is still open: dropping the sender
+                // silently is indistinguishable from a complete answer, and
+                // the receiver would persist the truncated text as one.
+                let _ = tx.send(StreamItem::Failed).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// The body of [`Self::invoke_stream`], split out so every `?` in it
+    /// routes through the one place that reports failure on the channel.
+    async fn stream_inner(
+        &self,
+        user_text: &str,
+        tx: &mpsc::Sender<StreamItem>,
     ) -> Result<()> {
         let url = format!("{}/api/generate", self.base_url);
         let mut response = self
-            .http
+            .http_stream
             .post(&url)
             .json(&self.request(user_text, true))
             .send()
@@ -310,7 +393,7 @@ impl EullmClient {
                     token_count += 1;
 
                     // Forward token; bail if receiver dropped.
-                    if tx.send(sc.response).await.is_err() {
+                    if tx.send(StreamItem::Token(sc.response)).await.is_err() {
                         return Ok(());
                     }
 
@@ -408,6 +491,30 @@ mod tests {
         let prompt = c.build_prompt("Hello world");
         assert!(prompt.starts_with("<|im_start|>user\nHello world<|im_end|>"));
         assert!(prompt.ends_with(NO_THINK));
+    }
+
+    /// The contract the SSE layer depends on: a stream that dies reports it
+    /// on the channel, it does not just stop. Without the final `Failed`,
+    /// query_stream's receiver sees the same closed channel it sees after a
+    /// complete answer and persists the truncated text as the reply.
+    /// Port 1 on loopback refuses the connection, so this exercises the
+    /// failure path without needing a server.
+    #[tokio::test]
+    async fn failed_stream_reports_on_the_channel_before_returning() {
+        let c = EullmClient::new(
+            "http://127.0.0.1:1".into(),
+            "qwen3:14b".into(),
+            16384, 4096, 1.3, 256, -1,
+        );
+        let (tx, mut rx) = mpsc::channel::<StreamItem>(8);
+        let res = c.invoke_stream("hello", tx).await;
+        assert!(res.is_err(), "a refused connection must surface as an error");
+        assert_eq!(
+            rx.recv().await,
+            Some(StreamItem::Failed),
+            "the consumer must be told the answer is incomplete"
+        );
+        assert_eq!(rx.recv().await, None, "Failed is always the last item");
     }
 
     #[test]

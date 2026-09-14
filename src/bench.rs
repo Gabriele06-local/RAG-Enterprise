@@ -25,7 +25,7 @@ use anyhow::{Context, Result};
 use qdrant_client::Qdrant;
 
 use crate::clients::embeddings::EmbeddingService;
-use crate::clients::eullm::EullmClient;
+use crate::clients::eullm::{EullmClient, StreamItem};
 use crate::clients::qdrant_store::QdrantStore;
 use crate::config::Settings;
 use crate::documents::parser;
@@ -435,7 +435,7 @@ async fn run_inference(
     let prompt_build = t.elapsed();
 
     tracing::info!("starting eullm generation");
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(256);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamItem>(256);
     let eullm_task = eullm.clone();
     let prompt_for_task = full_prompt.clone();
     let gen_handle = tokio::spawn(async move { eullm_task.invoke_stream(&prompt_for_task, tx).await });
@@ -443,7 +443,13 @@ async fn run_inference(
     let gen_start = Instant::now();
     let mut ttft: Option<Duration> = None;
     let mut tokens_generated = 0usize;
-    while let Some(_token) = rx.recv().await {
+    while let Some(item) = rx.recv().await {
+        // StreamItem::Failed is not a token and must not be counted as one;
+        // the error behind it comes back through the join below, which is
+        // where this function reports it.
+        if !matches!(item, StreamItem::Token(_)) {
+            continue;
+        }
         if ttft.is_none() {
             ttft = Some(gen_start.elapsed());
             tracing::info!(ttft_ms = gen_start.elapsed().as_millis(), "first token received");
