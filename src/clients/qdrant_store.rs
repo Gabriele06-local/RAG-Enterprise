@@ -10,6 +10,9 @@
 //!   provenance_id, retrieval_text — see ChunkPayload.
 //! - search: optional score_threshold; returns {id, similarity, payload}
 //! - delete_document: filters by document_id
+//!
+//! Searches go through the Query API: the older Search endpoints are
+//! deprecated, and Qdrant's 1.19 release notes announce their removal.
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -18,7 +21,7 @@ use qdrant_client::{
     qdrant::{
         Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder,
         DeletePointsBuilder, Distance, FieldType, Filter, PointStruct,
-        SearchPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
+        QueryPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
         VectorsConfig, vectors_config::Config,
     },
 };
@@ -176,12 +179,14 @@ impl VectorStore for QdrantStore {
         top_k: u64,
         score_threshold: Option<f32>,
     ) -> Result<Vec<SearchHit>> {
-        let mut builder =
-            SearchPointsBuilder::new(&self.collection, query_vec, top_k).with_payload(true);
+        let mut builder = QueryPointsBuilder::new(&self.collection)
+            .query(query_vec)
+            .limit(top_k)
+            .with_payload(true);
         if let Some(t) = score_threshold {
             builder = builder.score_threshold(t);
         }
-        let resp = self.client.search_points(builder).await?;
+        let resp = self.client.query(builder).await?;
         let returned = resp.result.len();
         let hits: Vec<SearchHit> = resp
             .result
