@@ -356,6 +356,11 @@ async fn process_upload(state: &AppState, mut multipart: Multipart) -> Response 
 
     let upsert_start = std::time::Instant::now();
     if let Err(e) = state.qdrant.upsert(&embeddings, &payloads).await {
+        // The upsert goes in batches of 1000 (see QdrantStore::upsert): one
+        // that fails part-way has already stored the batches before it, and
+        // no SQLite row will ever point at them. Same orphan as the failed
+        // insert below, same cleanup.
+        discard_vectors(state, &document_id).await;
         return err(StatusCode::INTERNAL_SERVER_ERROR, format!("qdrant upsert: {e}"));
     }
     let upsert_time = upsert_start.elapsed();
@@ -393,14 +398,7 @@ async fn process_upload(state: &AppState, mut multipart: Multipart) -> Response 
         // - and worse than the one purge_document refuses to create, because
         // the document list is read from SQLite: no id to delete them by, so
         // nothing can ever reach them again.
-        if let Err(cleanup) = state.qdrant.delete_document(&document_id).await {
-            tracing::error!(
-                document_id = %document_id,
-                error = %cleanup,
-                "db insert failed and its vectors could not be removed: they stay in \
-                 the collection, retrievable and unreachable, until it is rebuilt"
-            );
-        }
+        discard_vectors(state, &document_id).await;
         return err(StatusCode::INTERNAL_SERVER_ERROR, format!("db insert: {e}"));
     }
 
@@ -535,6 +533,21 @@ pub(crate) async fn purge_document(state: &AppState, document_id: &str) -> anyho
     }
 
     Ok(removed)
+}
+
+/// Removes the vectors a failed upload already wrote, so none is left that a
+/// query retrieves but no document row lets anyone delete. Best-effort: the
+/// caller still reports the failure that happened, and a cleanup that fails
+/// as well is logged as what it leaves behind.
+async fn discard_vectors(state: &AppState, document_id: &str) {
+    if let Err(cleanup) = state.qdrant.delete_document(document_id).await {
+        tracing::error!(
+            document_id = %document_id,
+            error = %cleanup,
+            "upload failed and its vectors could not be removed: they stay in \
+             the collection, retrievable and unreachable, until it is rebuilt"
+        );
+    }
 }
 
 /// Where an upload is staged while it is parsed, and with what permissions.

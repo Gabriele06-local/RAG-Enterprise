@@ -6,4 +6,6 @@
   from SQLite — never showed it. So there was no id to delete them by and no
   way to reach them again short of rebuilding the collection. The vectors are
   now removed again when the insert fails, which is the same invariant
-  `purge_document` already states for the delete path.
+  `purge_document` already states for the delete path — and when the Qdrant
+  write itself fails part-way, which on a document of more than 1000 chunks
+  left the batches already written behind in the same way.
