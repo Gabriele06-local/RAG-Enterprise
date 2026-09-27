@@ -385,6 +385,22 @@ async fn process_upload(state: &AppState, mut multipart: Multipart) -> Response 
         db::documents::insert(&state.db, &document_id, &filename, page_count, &ext, chunks.len())
             .await
     {
+        // INVARIANT, the mirror of the one in purge_document below: the
+        // vectors went in first (step 5), so an insert that fails must take
+        // them back out. Left there they are an orphan in the sense that
+        // matters - still retrieved by a query, still quoted as a source
+        // pointing at an id that resolves to nothing, still holding their RAM
+        // - and worse than the one purge_document refuses to create, because
+        // the document list is read from SQLite: no id to delete them by, so
+        // nothing can ever reach them again.
+        if let Err(cleanup) = state.qdrant.delete_document(&document_id).await {
+            tracing::error!(
+                document_id = %document_id,
+                error = %cleanup,
+                "db insert failed and its vectors could not be removed: they stay in \
+                 the collection, retrievable and unreachable, until it is rebuilt"
+            );
+        }
         return err(StatusCode::INTERNAL_SERVER_ERROR, format!("db insert: {e}"));
     }
 
