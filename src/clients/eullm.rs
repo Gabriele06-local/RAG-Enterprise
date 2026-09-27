@@ -10,7 +10,7 @@
 //! - NO "stop" field anywhere in the payload.
 //! - Strip <think>...</think> blocks from non-streaming response.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -384,7 +384,20 @@ impl EullmClient {
                 }
                 let sc: StreamChunk = match serde_json::from_str(line) {
                     Ok(c) => c,
-                    Err(_) => continue,
+                    Err(_) => {
+                        // eullm reports a failure mid-generation as an `error`
+                        // object on its own line, which is not a StreamChunk.
+                        // Skipping it ended the stream *cleanly*, so the
+                        // truncated text was persisted as the model's answer -
+                        // the very thing the Failed marker exists to prevent
+                        // (see invoke_stream). Anything else that does not
+                        // parse is still skipped: only a recognised error ends
+                        // the stream.
+                        if let Some(message) = stream_line_error(line) {
+                            bail!("eullm stream: {message}");
+                        }
+                        continue;
+                    }
                 };
 
                 if !sc.response.is_empty() {
@@ -421,6 +434,26 @@ impl EullmClient {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// The failure a stream line reports, if it reports one: eullm's own error
+/// object, which shares the NDJSON stream with the `StreamChunk` lines and so
+/// reaches the parser as a line that is not a chunk.
+///
+/// Only an object with a non-empty `error` counts. A line that is not JSON at
+/// all, or JSON of some other shape, is not evidence of anything and is left
+/// to the caller's skip: an unrecognised line from a newer eullm must not cut
+/// a good answer short.
+fn stream_line_error(line: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let message = value.get("error")?;
+    let message = match message {
+        // An absent-or-null field says nothing went wrong.
+        serde_json::Value::Null => return None,
+        serde_json::Value::String(text) => text.trim().to_owned(),
+        other => other.to_string(),
+    };
+    (!message.is_empty()).then_some(message)
+}
 
 /// Returns the last `max_bytes` of `s`, aligned to a char boundary.
 fn tail_slice(s: &str, max_bytes: usize) -> &str {
@@ -578,10 +611,47 @@ mod tests {
     fn tail_slice_short() {
         assert_eq!(tail_slice("abc", 800), "abc");
     }
-
     #[test]
     fn tail_slice_truncates() {
         let s = "x".repeat(1000);
         assert_eq!(tail_slice(&s, 800).len(), 800);
+    }
+
+    /// The contract this fixes: an error line must be recognisable, or the
+    /// stream ends "cleanly" and the truncated text is kept as the answer.
+    #[test]
+    fn an_error_line_on_the_stream_is_recognised() {
+        assert_eq!(
+            stream_line_error(r#"{"error":"context length exceeded"}"#).as_deref(),
+            Some("context length exceeded")
+        );
+        assert_eq!(
+            stream_line_error(r#"{"error":"  out of memory  "}"#).as_deref(),
+            Some("out of memory")
+        );
+        assert_eq!(
+            stream_line_error(r#"{"error":{"code":500,"message":"boom"}}"#).as_deref(),
+            Some(r#"{"code":500,"message":"boom"}"#),
+            "a structured error is still an error"
+        );
+    }
+
+    /// Only a recognised error ends the stream: a keep-alive, a preamble from
+    /// a newer eullm, or a corrupted line must not cut a good answer short.
+    #[test]
+    fn other_unparsable_lines_are_not_treated_as_failures() {
+        for line in [
+            "",
+            " ",
+            "data: ping",
+            "\u{fffd}not json at all",
+            "[1,2,3]",
+            r#"{"response":"ciao","done":true}"#,
+            r#"{"error":""}"#,
+            r#"{"error":null}"#,
+            r#"{"something_else":"error"}"#,
+        ] {
+            assert_eq!(stream_line_error(line), None, "line={line:?}");
+        }
     }
 }
