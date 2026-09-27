@@ -64,6 +64,18 @@ pub async fn run_with_extensions(
         return Ok(());
     }
 
+    // A `--bench` that cannot be honoured used to fall through to everything
+    // below: the benchmark silently became a full server start, database and
+    // HTTP listener included, with no report written and nothing in the log to
+    // explain the absence of one. Asked for here, before anything is
+    // provisioned, so a misspelt flag costs nothing.
+    if bench::bench_requested(&args) && bench::parse_args(&args).is_none() {
+        anyhow::bail!(
+            "--bench/--benchmark needs the path of a document to benchmark, \
+             e.g. --bench /path/to/document.pdf"
+        );
+    }
+
     observability::init_tracing();
 
     let settings = config::Settings::load()?;
