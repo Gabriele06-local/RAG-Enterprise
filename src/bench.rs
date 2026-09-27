@@ -989,9 +989,13 @@ pub async fn run(
     let bench_collection = format!("{}_benchmark", settings.qdrant.collection);
     tracing::info!(collection = %bench_collection, "wiping the benchmark collection");
     reset_benchmark_collection(&settings.qdrant.grpc_url, &bench_collection).await?;
-    let qdrant = QdrantStore::new(&settings.qdrant.grpc_url, &bench_collection)
-        .await
-        .context("init Qdrant benchmark")?;
+    let qdrant = QdrantStore::new(
+        &settings.qdrant.grpc_url,
+        &bench_collection,
+        settings.qdrant.quantization,
+    )
+    .await
+    .context("init Qdrant benchmark")?;
 
     tracing::info!(doc = %args.doc_path.display(), "starting the ingestion benchmark");
     // Same order as api/documents.rs::upload() on a real ingestion: free the
