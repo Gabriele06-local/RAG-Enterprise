@@ -167,6 +167,9 @@ EULLM__MODEL=qwen3-14b           # only read when you run eullm yourself; when
                                  # the engine starts it, the GGUF path from
                                  # manifest.toml is used instead
 QDRANT__COLLECTION=rag_documents
+QDRANT__QUANTIZATION=off         # turbo4 / turbo2: the vectors take 8 / 16
+                                 # times less RAM, for results nearly but not
+                                 # always the same — see .env.example
 EMBEDDINGS__REQUIRE_GPU=false    # true = refuse to start without CUDA rather
                                  # than silently falling back to a much slower CPU
 DATA__DIR=/path/to/data          # defaults to the binary's own directory

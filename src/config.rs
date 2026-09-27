@@ -70,6 +70,32 @@ pub struct QdrantSettings {
     pub grpc_url: String,
     #[serde(default = "default_collection")]
     pub collection: String,
+    /// See VectorQuantization. Env: QDRANT__QUANTIZATION
+    /// ("off" | "turbo4" | "turbo2").
+    #[serde(default)]
+    pub quantization: VectorQuantization,
+}
+
+/// How the collection keeps its vectors in memory. Qdrant's TurboQuant
+/// (1.18+) keeps a compressed copy of every vector in RAM and moves the
+/// originals to disk, where they are read back only to re-score each
+/// search's best candidates. That keeps the results close to a
+/// full-precision search's, not equal: a chunk the compression ranks below
+/// the shortlist is never re-scored, so it is missed. The setting is applied
+/// to the existing collection at startup, both ways; Qdrant re-encodes the
+/// vectors in the background.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorQuantization {
+    /// Every vector in RAM at full precision: 4 KiB each at 1024 dimensions.
+    /// The historical behaviour.
+    #[default]
+    Off,
+    /// 4 bits per dimension: about 8 times less RAM for the vectors.
+    Turbo4,
+    /// 2 bits per dimension: about 16 times less, for boards short of RAM.
+    /// Each search re-scores more candidates to make up for it.
+    Turbo2,
 }
 
 #[derive(Debug, Deserialize)]
@@ -390,6 +416,7 @@ impl Default for QdrantSettings {
             url: default_qdrant_url(),
             grpc_url: default_qdrant_grpc_url(),
             collection: default_collection(),
+            quantization: VectorQuantization::default(),
         }
     }
 }
@@ -1019,6 +1046,7 @@ mod tests {
         "QDRANT__URL",
         "QDRANT__GRPC_URL",
         "QDRANT__COLLECTION",
+        "QDRANT__QUANTIZATION",
         "EULLM__URL",
         "EULLM__MODEL",
         "EULLM__NUM_CTX",
@@ -1043,6 +1071,23 @@ mod tests {
         "DATA__DIR",
         "DATA__MANAGE_SUBPROCESSES",
     ];
+
+    #[test]
+    fn qdrant_quantization_reads_the_documented_values() {
+        let read = |value: &str| {
+            ::config::Config::builder()
+                .set_override("quantization", value)
+                .unwrap()
+                .build()
+                .unwrap()
+                .try_deserialize::<QdrantSettings>()
+        };
+        assert_eq!(read("off").unwrap().quantization, VectorQuantization::Off);
+        assert_eq!(read("turbo4").unwrap().quantization, VectorQuantization::Turbo4);
+        assert_eq!(read("turbo2").unwrap().quantization, VectorQuantization::Turbo2);
+        assert!(read("turbo3").is_err(), "a typo must not quietly mean off");
+        assert_eq!(QdrantSettings::default().quantization, VectorQuantization::Off);
+    }
 
     /// `Some(key)` when the line assigns `KEY=...`, commented or not;
     /// `None` for prose, blanks and anything not shaped like a key.

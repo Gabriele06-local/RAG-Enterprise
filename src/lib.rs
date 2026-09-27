@@ -156,6 +156,7 @@ pub async fn run_with_extensions(
     let qdrant = clients::qdrant_store::QdrantStore::new(
         &settings.qdrant.grpc_url,
         &settings.qdrant.collection,
+        settings.qdrant.quantization,
     )
     .await
     .context("qdrant init")?;
