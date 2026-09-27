@@ -39,9 +39,20 @@ pub struct BenchArgs {
 /// `--bench <path>` or `--benchmark <path>`, with zero or more repeated
 /// `--bench-query "…"`. When no query is given, run() uses a small generic
 /// set.
+///
+/// `None` for "not a benchmark run" and for "a `--bench` that cannot be
+/// honoured" alike: a flag with no path, or one followed by another flag
+/// (`--bench --bench-query "q"`), which used to be taken for the path to
+/// benchmark. [`bench_requested`] is what tells the two apart, so the caller
+/// can say which happened instead of starting the server on a typo.
 pub fn parse_args(args: &[String]) -> Option<BenchArgs> {
     let bench_idx = args.iter().position(|a| a == "--bench" || a == "--benchmark")?;
     let doc_path = PathBuf::from(args.get(bench_idx + 1)?);
+    // A path never starts with a dash, and a flag that landed here is a
+    // misspelt invocation, not a file called `--bench-query`.
+    if doc_path.to_string_lossy().starts_with('-') {
+        return None;
+    }
 
     let mut queries = Vec::new();
     let mut i = 0;
@@ -54,6 +65,14 @@ pub fn parse_args(args: &[String]) -> Option<BenchArgs> {
         }
     }
     Some(BenchArgs { doc_path, queries })
+}
+
+/// Whether a `--bench`/`--benchmark` flag was passed at all, whether or not it
+/// was followed by a usable path. Paired with [`parse_args`]: a `false` here
+/// means the server should start normally, a `true` with `parse_args` returning
+/// `None` means the flag was misspelt and the run should stop and say so.
+pub fn bench_requested(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--bench" || a == "--benchmark")
 }
 
 /// `--bench-live`: an alternative to `--bench <file>`. The server and
@@ -1160,6 +1179,41 @@ mod tests {
     #[test]
     fn parse_args_missing_path_returns_none() {
         assert!(parse_args(&args(&["i3k-rag-engine", "--bench"])).is_none());
+    }
+
+    /// A flag in the path position is a misspelt invocation, not a document
+    /// called `--bench-query`.
+    #[test]
+    fn a_flag_is_not_taken_as_the_document_path() {
+        assert!(parse_args(&args(&[
+            "i3k-rag-engine",
+            "--bench",
+            "--bench-query",
+            "first question",
+        ]))
+        .is_none());
+        assert!(parse_args(&args(&["i3k-rag-engine", "--bench", "-x"])).is_none());
+    }
+
+    /// What the caller pairs `parse_args`' `None` with: the flag was there, so
+    /// the run must stop rather than quietly start the server.
+    #[test]
+    fn bench_requested_distinguishes_a_misspelt_flag_from_no_flag() {
+        assert!(!bench_requested(&args(&["i3k-rag-engine"])));
+        assert!(!bench_requested(&args(&["i3k-rag-engine", "--bench-live"])));
+        assert!(bench_requested(&args(&["i3k-rag-engine", "--bench"])));
+        assert!(bench_requested(&args(&[
+            "i3k-rag-engine",
+            "--benchmark",
+            "doc.pdf"
+        ])));
+        // Requested and usable: the two callers together take the normal path.
+        assert!(bench_requested(&args(&[
+            "i3k-rag-engine",
+            "--bench",
+            "doc.pdf"
+        ])));
+        assert!(parse_args(&args(&["i3k-rag-engine", "--bench", "doc.pdf"])).is_some());
     }
 
     #[test]
