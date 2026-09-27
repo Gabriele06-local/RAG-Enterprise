@@ -275,8 +275,9 @@ impl VectorStore for QdrantStore {
         }
         if let Some(oversampling) = oversampling_for(self.quantization) {
             // Pick the candidates on the compressed vectors, then order them
-            // by the originals: what keeps quantized results as good as
-            // full-precision ones.
+            // by the originals. Only that shortlist is re-scored: a chunk
+            // the compression ranks below it is missed, the price of the RAM
+            // saved (see VectorQuantization).
             builder = builder.params(
                 SearchParamsBuilder::default().quantization(
                     QuantizationSearchParamsBuilder::default()
@@ -359,8 +360,8 @@ fn same_turbo(wanted: &TurboQuantization, current: &TurboQuantization) -> bool {
 }
 
 /// How many candidates per result each search re-scores against the
-/// original vectors: the fewer the bits, the more it takes to find the same
-/// results as a full-precision search.
+/// original vectors: the fewer the bits, the more it takes to stay close to
+/// a full-precision search. Close, not equal — see VectorQuantization.
 fn oversampling_for(quantization: VectorQuantization) -> Option<f64> {
     match quantization {
         VectorQuantization::Off => None,
@@ -403,6 +404,8 @@ mod tests {
     /// Ten documents of forty chunks, each document around its own
     /// direction, chunk k drifting further from it as k grows: a query at a
     /// document's direction must find its chunks 0 to 4, in that order.
+    /// Clear gaps on purpose — near-ties are what quantization may reorder
+    /// or drop, which is accepted, so here any difference is a bug.
     fn corpus() -> (Vec<Vec<f32>>, Vec<ChunkPayload>, Vec<Vec<f32>>) {
         let mut seed = 0x2545_f491_4f6c_dd1d_u64;
         let mut noise = move || {
@@ -474,7 +477,7 @@ mod tests {
     }
 
     /// The Query API, TurboQuant switched on and back off on a live
-    /// collection, the searches finding the same chunks either way, and a
+    /// collection, a clear ranking coming out the same either way, and a
     /// restart with the same setting leaving the collection alone.
     ///
     ///   QDRANT_GRPC_URL_FOR_TEST=http://localhost:6334 \

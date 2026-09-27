@@ -78,10 +78,12 @@ pub struct QdrantSettings {
 
 /// How the collection keeps its vectors in memory. Qdrant's TurboQuant
 /// (1.18+) keeps a compressed copy of every vector in RAM and moves the
-/// originals to disk, where they are read back only to re-score the best
-/// candidates of each search — which is what keeps the results as good as
-/// without it. The setting is applied to the existing collection at
-/// startup, both ways; Qdrant re-encodes the vectors in the background.
+/// originals to disk, where they are read back only to re-score each
+/// search's best candidates. That keeps the results close to a
+/// full-precision search's, not equal: a chunk the compression ranks below
+/// the shortlist is never re-scored, so it is missed. The setting is applied
+/// to the existing collection at startup, both ways; Qdrant re-encodes the
+/// vectors in the background.
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VectorQuantization {
