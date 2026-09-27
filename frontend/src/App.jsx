@@ -676,9 +676,18 @@ function App() {
         ? 'The model took too long to answer. Please try again.'
         : `Error: ${error.message}`
       if (assistantPushed) {
+        // Keep what already streamed in, exactly as the { error: ... } event
+        // above does: a socket reset after 800 tokens used to wipe the answer
+        // the user had just watched arrive and leave only "Error: ...". The
+        // transport failed, not the answer — the text is still what the model
+        // said up to that point, and hiding it loses it for good (it was never
+        // persisted, so a reload will not bring it back).
         setMessages(prev => {
           const next = [...prev]
-          next[next.length - 1] = { role: 'assistant', content: errorContent, error: true, timestamp: new Date().toISOString() }
+          const last = next[next.length - 1]
+          next[next.length - 1] = {
+            ...last, content: `${last.content}\n\n[${errorContent}]`, error: true,
+          }
           return next
         })
       } else {
