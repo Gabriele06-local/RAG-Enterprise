@@ -752,6 +752,43 @@ function App() {
     }
   }
 
+  // Fetches the original behind the token, then saves it. A plain
+  // <a href download> cannot work here: the API authenticates on
+  // Authorization: Bearer only (see auth::extractor - there is no cookie to
+  // ride along on, which is exactly what the CORS comment says about
+  // credentials), and a link click sends no such header. So the citation
+  // used to navigate to the endpoint, get a 401, and hand the user a JSON
+  // error body named after the document.
+  const downloadSource = async (documentId, fallbackName) => {
+    try {
+      const res = await axios.get(`${API_URL}/api/documents/${documentId}/download`, {
+        responseType: 'blob',
+      })
+      // The server knows the name it stored; its Content-Disposition is
+      // already sanitized (sanitize_header_filename), so no escaping needed.
+      const header = res.headers['content-disposition'] || ''
+      const match = header.match(/filename="([^"]*)"/)
+      const name = (match && match[1]) || fallbackName || documentId
+      const url = URL.createObjectURL(res.data)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = name
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      // Revoked on the next tick: revoking synchronously can cancel the
+      // download in some browsers before it has read the blob.
+      setTimeout(() => URL.revokeObjectURL(url), 0)
+    } catch (error) {
+      // A blob response means the error body is a Blob too, so the JSON
+      // message the other handlers read is not reachable here.
+      const status = error.response?.status
+      alert(status
+        ? `Download error: HTTP ${status}`
+        : `Download error: ${error.message}`)
+    }
+  }
+
   const handleDeleteDocument = async (documentId) => {
     if (!window.confirm('Delete this document?')) return
     try {
@@ -1403,14 +1440,14 @@ function App() {
                           {unique.map((source, sidx) => (
                             <div key={sidx} className="bg-slate-600 rounded p-2 text-sm">
                               <div className="flex justify-between items-center gap-2">
-                                <a
-                                  href={`${API_URL}/api/documents/${source.document_id}/download`}
-                                  download
-                                  className="text-blue-300 hover:text-blue-200 underline truncate flex-1"
+                                <button
+                                  type="button"
+                                  onClick={() => downloadSource(source.document_id, source.filename)}
+                                  className="text-blue-300 hover:text-blue-200 underline truncate flex-1 text-left"
                                   title={source.filename || source.document_id}
                                 >
                                   {source.filename || source.document_id}
-                                </a>
+                                </button>
                                 {source.page_start != null && (
                                   <span
                                     className="bg-slate-500 text-slate-100 px-2 py-1 rounded text-xs font-semibold flex-shrink-0"
