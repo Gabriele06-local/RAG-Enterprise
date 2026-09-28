@@ -59,6 +59,9 @@ function App() {
   const [conversations, setConversations] = useState([])
   const [currentConversationId, setCurrentConversationId] = useState(null)
   const [messages, setMessages] = useState([])
+  // The conversation on screen, readable from inside a streaming callback that
+  // closed over an older render's value - see answerBelongsHere in handleQuery.
+  const currentConversationIdRef = useRef(null)
 
   // Input query
   const [query, setQuery] = useState('')
@@ -99,6 +102,10 @@ function App() {
   useEffect(() => {
     if (isNearBottomRef.current) scrollToBottom()
   }, [messages])
+
+  useEffect(() => {
+    currentConversationIdRef.current = currentConversationId
+  }, [currentConversationId])
 
   useEffect(() => {
     const savedToken = localStorage.getItem('rag_auth_token')
@@ -543,6 +550,18 @@ function App() {
 
     modelLoadingTimerRef.current = setTimeout(() => setIsModelLoading(true), 5000)
 
+    // The conversation this answer belongs to. The sidebar is not disabled
+    // while a reply streams, so the user can start reading another one — and
+    // every setMessages below appends to the LAST message of whatever is on
+    // screen, which after a switch is a different conversation entirely. So a
+    // switch away does not merely hide the tokens: it spliced the tail of one
+    // answer into an unrelated thread, and it grew a message list the backend
+    // never had. The backend files the answer under the id sent above, so it
+    // is there when the user comes back; here we only stop writing.
+    const streamConversationId = currentConversationIdRef.current
+    const stillOnStreamConversation = () =>
+      currentConversationIdRef.current === streamConversationId
+
     // SSE: the time to the first word does not change (it depends on prefill),
     // but the user sees the text appear progressively instead of waiting for
     // the whole answer — decisive on long answers. The assistant placeholder
@@ -554,6 +573,7 @@ function App() {
     let assistantPushed = false
 
     const appendToken = (token) => {
+      if (!stillOnStreamConversation()) return
       if (!assistantPushed) {
         assistantPushed = true
         setIsModelLoading(false)
@@ -625,7 +645,7 @@ function App() {
 
           if (payload.token !== undefined) {
             appendToken(payload.token)
-          } else if (payload.error) {
+          } else if (payload.error && stillOnStreamConversation()) {
             // Generation was cut off (see StreamItem::Failed in
             // clients/eullm.rs): the backend does not persist the partial
             // text, so it will not come back as the answer on the next load.
@@ -647,7 +667,7 @@ function App() {
                 error: true, timestamp: new Date().toISOString(),
               }])
             }
-          } else if (payload.done) {
+          } else if (payload.done && stillOnStreamConversation()) {
             if (assistantPushed) {
               setMessages(prev => {
                 const next = [...prev]
@@ -665,7 +685,7 @@ function App() {
         }
       }
 
-      if (!assistantPushed) {
+      if (!assistantPushed && stillOnStreamConversation()) {
         setMessages(prev => [...prev, {
           role: 'assistant', content: '(no answer received)', error: true, timestamp: new Date().toISOString(),
         }])
@@ -675,7 +695,12 @@ function App() {
       const errorContent = isTimeout
         ? 'The model took too long to answer. Please try again.'
         : `Error: ${error.message}`
-      if (assistantPushed) {
+      if (!stillOnStreamConversation()) {
+        // The user has moved on to another conversation: the failure is still
+        // in the console, but writing it into whatever is on screen now would
+        // put it in a thread this answer was never part of.
+        console.error('query stream failed after leaving the conversation:', error)
+      } else if (assistantPushed) {
         // Keep what already streamed in, exactly as the { error: ... } event
         // above does: a socket reset after 800 tokens used to wipe the answer
         // the user had just watched arrive and leave only "Error: ...". The
