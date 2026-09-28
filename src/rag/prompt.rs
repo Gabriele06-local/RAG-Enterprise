@@ -90,18 +90,19 @@ pub fn build_prompt(context: &str, question: &str, history: &[(String, String)])
 fn render(template: &str, values: &[(&str, &str)]) -> String {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
-    'fill: while !rest.is_empty() {
-        for (key, value) in values {
-            if let Some(at) = rest.find(key) {
-                out.push_str(&rest[..at]);
-                out.push_str(value);
-                rest = &rest[at + key.len()..];
-                continue 'fill;
-            }
-        }
-        out.push_str(rest);
-        return out;
+    // The key that comes first in what is left, whichever it is in the list:
+    // taking keys in list order would copy an earlier, different key past it
+    // verbatim, leaving that slot unfilled.
+    while let Some((at, key, value)) = values
+        .iter()
+        .filter_map(|&(key, value)| rest.find(key).map(|at| (at, key, value)))
+        .min_by_key(|&(at, _, _)| at)
+    {
+        out.push_str(&rest[..at]);
+        out.push_str(value);
+        rest = &rest[at + key.len()..];
     }
+    out.push_str(rest);
     out
 }
 
@@ -205,5 +206,18 @@ mod tests {
         assert_eq!(render("abc", &[("{b}", "B")]), "abc");
         assert_eq!(render("a{b}c", &[("{z}", "Z")]), "a{b}c");
         assert_eq!(render("", &[("{b}", "B")]), "");
+    }
+
+    /// Keys out of the list's order are all filled: whichever comes first in
+    /// the template is substituted first.
+    #[test]
+    fn keys_are_filled_in_the_order_they_appear_in_the_template() {
+        assert_eq!(
+            render(
+                "Q: {question}\nC: {context}",
+                &[("{context}", "CTX"), ("{question}", "Q?")]
+            ),
+            "Q: Q?\nC: CTX"
+        );
     }
 }
