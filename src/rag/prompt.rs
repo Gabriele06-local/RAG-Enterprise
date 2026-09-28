@@ -61,11 +61,48 @@ fn truncate(s: &str, max_chars: usize) -> String {
 /// Build the full prompt string.
 pub fn build_prompt(context: &str, question: &str, history: &[(String, String)]) -> String {
     let history_section = format_history(history);
-    QA_PROMPT
-        .replace("{structured_data_section}", "")
-        .replace("{history_section}", &history_section)
-        .replace("{context}", context)
-        .replace("{question}", question)
+    render(
+        QA_PROMPT,
+        &[
+            ("{structured_data_section}", ""),
+            ("{history_section}", &history_section),
+            ("{context}", context),
+            ("{question}", question),
+        ],
+    )
+}
+
+/// Substitutes each `key` in `template` with its value, in one pass.
+///
+/// Deliberately not a chain of `str::replace` calls. Each of those scans the
+/// string produced by the previous one, so a value that itself contains a
+/// later key is substituted too: a document whose text contains the literal
+/// `{question}` — a template guide, a config file, this very project — had
+/// that token replaced by the user's question, inside the evidence. The
+/// retrieved chunks stopped being what the document actually says, and the
+/// `{ context }`/`{ question }` markers of an injected history could be
+/// rewritten the same way.
+///
+/// Here `rest` only ever points into `template`, never into what has already
+/// been emitted, so an inserted value is appended to the output and never
+/// looked at again. Within the template the first occurrence of a key wins,
+/// which is the one the author wrote.
+fn render(template: &str, values: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    'fill: while !rest.is_empty() {
+        for (key, value) in values {
+            if let Some(at) = rest.find(key) {
+                out.push_str(&rest[..at]);
+                out.push_str(value);
+                rest = &rest[at + key.len()..];
+                continue 'fill;
+            }
+        }
+        out.push_str(rest);
+        return out;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -101,5 +138,72 @@ mod tests {
         let hist = vec![(long.clone(), long)];
         let out = format_history(&hist);
         assert!(out.contains("CONVERSATION HISTORY:"));
+    }
+
+    /// The shape the template is supposed to produce, pinned so the one-pass
+    /// substitution below cannot quietly change the prompt.
+    #[test]
+    fn the_prompt_is_the_template_with_its_four_slots_filled() {
+        let out = build_prompt("[report.pdf]\nRevenue grew.", "How much?", &[]);
+        assert!(!out.contains("{structured_data_section}"), "{out}");
+        assert!(!out.contains("{history_section}"), "{out}");
+        assert!(
+            out.contains("RETRIEVED CHUNKS:\n[report.pdf]\nRevenue grew."),
+            "{out}"
+        );
+        assert!(out.contains("QUESTION: How much?"), "{out}");
+        assert!(
+            out.starts_with("/no_think\nYou are an expert research analyst."),
+            "{out}"
+        );
+        assert!(out.ends_with("ANSWER:"), "{out}");
+    }
+
+    /// The bug: evidence is untrusted input, and it is substituted before the
+    /// question. A chain of `replace` calls rewrote the token inside it.
+    #[test]
+    fn a_placeholder_inside_a_retrieved_chunk_is_left_alone() {
+        let chunk = "To render a field use {context}, then {question}.";
+        let out = build_prompt(chunk, "What is the revenue?", &[]);
+        assert!(
+            out.contains("To render a field use {context}, then {question}."),
+            "the chunk was rewritten: {out}"
+        );
+        assert!(
+            out.contains("QUESTION: What is the revenue?"),
+            "the template's own slot went unfilled: {out}"
+        );
+    }
+
+    /// Same, one step earlier in the chain: a stored message that happens to
+    /// contain a later key.
+    #[test]
+    fn a_placeholder_inside_the_history_is_left_alone() {
+        let history = vec![(
+            "How do I use {context}?".to_owned(),
+            "It is filled in already.".to_owned(),
+        )];
+        let out = build_prompt("Revenue grew.", "And now?", &history);
+        assert!(out.contains("User: How do I use {context}?"), "{out}");
+        assert!(out.contains("Assistant: It is filled in already."), "{out}");
+    }
+
+    /// A value carrying a key for a slot that comes *before* it in the
+    /// template must not be re-scanned either.
+    #[test]
+    fn a_value_containing_an_earlier_key_is_not_resubstituted() {
+        let out = build_prompt("see {history_section}", "q", &[]);
+        assert!(out.contains("see {history_section}"), "{out}");
+        assert!(!out.contains("CONVERSATION HISTORY"), "{out}");
+    }
+
+    /// A key absent from the template is simply not substituted, and text
+    /// with no key at all is copied through untouched.
+    #[test]
+    fn render_copies_what_it_does_not_fill() {
+        assert_eq!(render("a{b}c", &[("{b}", "B")]), "aBc");
+        assert_eq!(render("abc", &[("{b}", "B")]), "abc");
+        assert_eq!(render("a{b}c", &[("{z}", "Z")]), "a{b}c");
+        assert_eq!(render("", &[("{b}", "B")]), "");
     }
 }
