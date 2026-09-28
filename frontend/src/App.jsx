@@ -59,6 +59,11 @@ function App() {
   const [conversations, setConversations] = useState([])
   const [currentConversationId, setCurrentConversationId] = useState(null)
   const [messages, setMessages] = useState([])
+  // The request whose answer is currently being written to the view. A stream
+  // checks it is still this one before every write, so a session that has been
+  // logged out of - or superseded - stops touching the screen instead of
+  // appending into whatever is on it now. See handleLogout.
+  const activeStreamRef = useRef(null)
 
   // Input query
   const [query, setQuery] = useState('')
@@ -195,6 +200,33 @@ function App() {
     localStorage.removeItem('rag_auth_user')
     setLoginForm({ username: '', password: '' })
     setShowAdminPanel(false)
+    // The "something is running" flags, too. They belong to the request that
+    // is still in flight, not to the session: leaving them set handed the NEXT
+    // login a dead interface, because only the abandoned request's own
+    // `finally` clears them, and a streaming answer runs until it ends or
+    // until its 630s abort fires. So logging out mid-answer left the question
+    // box and the Send button disabled for minutes, and logging out mid-upload
+    // left the file picker disabled for as long as the upload ran — with the
+    // previous session's "Processing (OCR -> Chunking -> Embedding)..." banner
+    // still on screen, and a still-armed model-loading timer that would flip
+    // the new session to "loading the model" five seconds later for no reason.
+    //
+    // The request is not aborted: the answer is already being generated
+    // server-side and stored against its conversation, and killing the
+    // connection would not undo that. What is dropped is this session's claim
+    // on the view: the stream is no longer the active one, so its remaining
+    // tokens and its eventual error are discarded rather than written into
+    // whatever the next login is looking at.
+    if (modelLoadingTimerRef.current) {
+      clearTimeout(modelLoadingTimerRef.current)
+      modelLoadingTimerRef.current = null
+    }
+    activeStreamRef.current = null
+    setQuerying(false)
+    setIsModelLoading(false)
+    setUploading(false)
+    setUploadProgress(0)
+    setUploadPhase('')
   }
 
   // ============================================================================
@@ -552,8 +584,14 @@ function App() {
     const controller = new AbortController()
     const timeoutId = setTimeout(() => controller.abort(), 630000)
     let assistantPushed = false
+    // This request now owns the view. Logging out (handleLogout) drops the
+    // claim without touching the connection, and every write below asks
+    // whether the claim still stands.
+    activeStreamRef.current = controller
+    const isActiveStream = () => activeStreamRef.current === controller
 
     const appendToken = (token) => {
+      if (!isActiveStream()) return
       if (!assistantPushed) {
         assistantPushed = true
         setIsModelLoading(false)
@@ -625,7 +663,7 @@ function App() {
 
           if (payload.token !== undefined) {
             appendToken(payload.token)
-          } else if (payload.error) {
+          } else if (payload.error && isActiveStream()) {
             // Generation was cut off (see StreamItem::Failed in
             // clients/eullm.rs): the backend does not persist the partial
             // text, so it will not come back as the answer on the next load.
@@ -647,7 +685,7 @@ function App() {
                 error: true, timestamp: new Date().toISOString(),
               }])
             }
-          } else if (payload.done) {
+          } else if (payload.done && isActiveStream()) {
             if (assistantPushed) {
               setMessages(prev => {
                 const next = [...prev]
@@ -665,7 +703,7 @@ function App() {
         }
       }
 
-      if (!assistantPushed) {
+      if (!assistantPushed && isActiveStream()) {
         setMessages(prev => [...prev, {
           role: 'assistant', content: '(no answer received)', error: true, timestamp: new Date().toISOString(),
         }])
@@ -675,7 +713,12 @@ function App() {
       const errorContent = isTimeout
         ? 'The model took too long to answer. Please try again.'
         : `Error: ${error.message}`
-      if (assistantPushed) {
+      if (!isActiveStream()) {
+        // This session has logged out from under the stream: the answer is
+        // stored server-side against its own conversation, but reporting the
+        // failure here would paste it into whatever is on screen now.
+        console.error('query stream ended after the session moved on:', error)
+      } else if (assistantPushed) {
         // Keep what already streamed in, exactly as the { error: ... } event
         // above does: a socket reset after 800 tokens used to wipe the answer
         // the user had just watched arrive and leave only "Error: ...". The
@@ -699,8 +742,13 @@ function App() {
         clearTimeout(modelLoadingTimerRef.current)
         modelLoadingTimerRef.current = null
       }
-      setQuerying(false)
-      setIsModelLoading(false)
+      // Only release the view if this stream still holds it: a later one may
+      // already own it, and clearing its claim would let it be written to.
+      if (isActiveStream()) {
+        activeStreamRef.current = null
+        setQuerying(false)
+        setIsModelLoading(false)
+      }
     }
   }
 
