@@ -211,7 +211,23 @@ fn pack_tar_gz(src: &Path, dest: &Path) -> Result<()> {
     let mut tar = tar::Builder::new(gz);
     tar.append_dir_all(".", src)
         .with_context(|| format!("tar append {}", src.display()))?;
-    tar.finish()?;
+    // finish() writes the tar end-of-archive marker and nothing else: the
+    // gzip stream is finalised by GzEncoder, and letting that happen in Drop
+    // threw the result away (`impl Drop for GzEncoder { try_finish() }`, whose
+    // error is discarded). A volume that filled during the last few KB
+    // therefore produced a truncated gzip that still decompressed to a
+    // perfectly plausible tar prefix, and this returned Ok - so the run logged
+    // "backup complete" and went on to prune, and the corrupt archive - the
+    // newest, so pinned first - was what the listing offered to restore while
+    // the good archives behind it were deleted.
+    let gz = tar.into_inner().context("finishing the tar stream")?;
+    // finish() writes the deflate final block and the CRC32/ISIZE trailer,
+    // and reports a write that failed doing so. Then sync: the point of a
+    // backup is that the bytes are on the disk, not only in the page cache,
+    // and nothing else here would notice a write that never landed.
+    let file = gz.finish().context("finishing the gzip stream")?;
+    file.sync_all()
+        .with_context(|| format!("flushing the archive {}", dest.display()))?;
     Ok(())
 }
 
@@ -576,6 +592,17 @@ fn unpack_tar_gz(archive: &Path, dest: &Path) -> Result<()> {
             .unpack(&out)
             .with_context(|| format!("extracting {}", path.display()))?;
     }
+
+    // Reaching the tar end-of-archive marker does not finish the gzip stream:
+    // flate2 has still not read the CRC32/ISIZE trailer. So a stream cut short
+    // after the tar was complete - which is exactly what a failed
+    // finalisation on the writing side produces - unpacked "successfully", and
+    // the members that had made it were silently all the archive contained.
+    // Draining the decoder to EOF is what proves the archive is whole: a
+    // missing or mismatched trailer surfaces as a read error here.
+    let mut gz = tar.into_inner();
+    std::io::copy(&mut gz, &mut std::io::sink())
+        .context("the archive's gzip stream is truncated or its checksum does not match")?;
     Ok(())
 }
 
@@ -862,6 +889,61 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.is_file() && second.is_file(), "second run must not overwrite the first");
         assert_eq!(list_backups(backup_dir.to_str().unwrap()).await.len(), 2);
+    }
+
+    /// The archive is a gzip stream, and its trailer is only written when the
+    /// encoder is finalised — which used to happen in `Drop`, where the error
+    /// is discarded. So a failure in the last few KB produced a truncated
+    /// stream that still decompressed to a plausible tar prefix, and
+    /// `pack_tar_gz` returned `Ok`.
+    ///
+    /// Nothing read a packed archive back: `two_backups_in_a_row…` only checks
+    /// `is_file()`. This one unpacks what `create_backup` produced and reads
+    /// the manifest and the database out of it, which fails on a stream whose
+    /// trailer is missing.
+    #[tokio::test]
+    async fn the_archive_packed_is_one_that_can_be_read_back() {
+        let d = tempfile::tempdir().unwrap();
+        let live = pool_at(&d.path().join("live.db")).await;
+        sqlx::query("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+            .execute(&live)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO users (id, name) VALUES (1, 'Ada')")
+            .execute(&live)
+            .await
+            .unwrap();
+
+        let archive = create_backup(
+            &live,
+            "",
+            "http://127.0.0.1:9",
+            "rag_documents",
+            d.path().join("backups").to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+
+        let out = d.path().join("unpacked");
+        unpack_tar_gz(&archive, &out).expect("the archive we just wrote must unpack");
+
+        let manifest: BackupManifest =
+            serde_json::from_slice(&std::fs::read(out.join(MANIFEST_FILE)).unwrap()).unwrap();
+        assert_eq!(manifest.format, MANIFEST_FORMAT);
+        assert_eq!(manifest.sqlite.size, std::fs::metadata(out.join("rag_users.db")).unwrap().len());
+
+        // Losing the tail is what a failed gzip finalisation on the writing
+        // side looks like on disk: the tar inside is complete, the container
+        // is not. Reading the members is not enough to notice - the trailer is
+        // only consulted once the stream is drained.
+        let whole = std::fs::read(&archive).unwrap();
+        let cut = whole.len() - 4;
+        std::fs::write(&archive, &whole[..cut]).unwrap();
+        assert!(
+            unpack_tar_gz(&archive, &d.path().join("unpacked2")).is_err(),
+            "an archive whose gzip trailer is missing must not read as complete"
+        );
     }
 
     // ── retention ───────────────────────────────────────────────────────────
