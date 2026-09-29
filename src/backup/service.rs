@@ -42,7 +42,14 @@ pub async fn create_backup(
     // 1. SQLite: VACUUM INTO for a WAL-safe consistent snapshot, then ask
     //    SQLite whether what came out is actually a sound database.
     let sqlite_dest = work_dir.join("rag_users.db");
-    sqlx::query(&format!("VACUUM INTO '{}'", sqlite_dest.display()))
+    // VACUUM INTO takes a string literal, not a bound parameter, and SQLite has
+    // no backslash escape: an apostrophe in the path terminated the literal
+    // there and the statement failed. So any deployment under, say,
+    // C:\Users\O'Neill\... or an iCloud/OneDrive folder with one could not be
+    // backed up at all - and from the 02:00 scheduler the only symptom was a
+    // single error line a day. Escaped exactly as restore_sqlite below does.
+    let sqlite_dest_literal = sqlite_dest.display().to_string().replace('\'', "''");
+    sqlx::query(&format!("VACUUM INTO '{sqlite_dest_literal}'"))
         .execute(db)
         .await
         .with_context(|| format!("VACUUM INTO {}", sqlite_dest.display()))?;
@@ -862,6 +869,49 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.is_file() && second.is_file(), "second run must not overwrite the first");
         assert_eq!(list_backups(backup_dir.to_str().unwrap()).await.len(), 2);
+    }
+
+    /// A backup directory whose path contains an apostrophe. `VACUUM INTO`
+    /// takes a string literal and SQLite has no backslash escape, so the
+    /// unescaped path ended the literal at the quote and the whole backup
+    /// failed - for every run, from a path a user chooses.
+    #[tokio::test]
+    async fn a_backup_directory_containing_an_apostrophe_still_works() {
+        let d = tempfile::tempdir().unwrap();
+        let live = pool_at(&d.path().join("live.db")).await;
+        sqlx::query("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+            .execute(&live)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO users (id, name) VALUES (1, 'O''Neill')")
+            .execute(&live)
+            .await
+            .unwrap();
+
+        let backup_dir = d.path().join("O'Neill's backups");
+        let archive = create_backup(
+            &live,
+            "",
+            // Port 9: nothing listens, so this takes the database-only path
+            // without needing a Qdrant.
+            "http://127.0.0.1:9",
+            "rag_documents",
+            backup_dir.to_str().unwrap(),
+            0,
+        )
+        .await
+        .expect("a path with an apostrophe must not break the backup");
+        assert!(archive.is_file(), "{}", archive.display());
+
+        // And the copy really is a sound database holding the row.
+        let copy = d.path().join("checked.db");
+        unpack_tar_gz(&archive, &copy).unwrap();
+        let restored = pool_at(&copy.join("rag_users.db")).await;
+        let name: String = sqlx::query_scalar("SELECT name FROM users WHERE id = 1")
+            .fetch_one(&restored)
+            .await
+            .unwrap();
+        assert_eq!(name, "O'Neill");
     }
 
     // ── retention ───────────────────────────────────────────────────────────
