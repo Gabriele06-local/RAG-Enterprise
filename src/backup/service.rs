@@ -253,11 +253,22 @@ async fn create_qdrant_snapshot(
 
     // POST /collections/{name}/snapshots → triggers creation, returns metadata
     let url = format!("{qdrant_url}/collections/{collection}/snapshots");
+    // The status is checked before the body is parsed, exactly as
+    // upload_qdrant_snapshot below does. Without it a 401 (bad api-key), a 404
+    // (no such collection) or a 500 has its body handed to serde, which fails
+    // with "error decoding response body" - the status is gone, and the
+    // operator is left reading a serde message instead of the one line that
+    // says why. That also puts a Qdrant-side failure into the same reqwest
+    // error kind as a broken body, which is neither connect, timeout nor
+    // request, so is_qdrant_unreachable does not classify it as "did not
+    // answer" - which is right, but only if the reason is legible.
     let resp: SnapshotResult = http
         .post(&url)
         .send()
         .await
         .context("qdrant snapshot POST")?
+        .error_for_status()
+        .with_context(|| format!("qdrant refused to create a snapshot of {collection}"))?
         .json()
         .await
         .context("qdrant snapshot POST response")?;
@@ -271,6 +282,8 @@ async fn create_qdrant_snapshot(
         .send()
         .await
         .context("qdrant snapshot download")?
+        .error_for_status()
+        .with_context(|| format!("qdrant refused to send snapshot {snap_name} of {collection}"))?
         .bytes()
         .await
         .context("qdrant snapshot download bytes")?;
@@ -865,6 +878,69 @@ mod tests {
     }
 
     // ── retention ───────────────────────────────────────────────────────────
+
+    /// A Qdrant that answers every snapshot request with `status` and `body`.
+    /// Binds a random port and serves until the test ends.
+    async fn qdrant_answering(status: axum::http::StatusCode, body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                axum::Router::new().fallback(move || async move { (status, body) }),
+            )
+            .await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// A snapshot that cannot be taken has to say which HTTP status said so.
+    /// The body Qdrant sends for a missing collection is a JSON error object,
+    /// which is not a `SnapshotResult`, so before the status was checked the
+    /// failure surfaced as "error decoding response body" and the 404 was
+    /// gone — the operator got a serde message and no idea whether the
+    /// collection was missing, the api-key wrong, or Qdrant broken.
+    #[tokio::test]
+    async fn a_refused_snapshot_names_the_status_that_refused_it() {
+        let d = tempfile::tempdir().unwrap();
+        let live = pool_at(&d.path().join("live.db")).await;
+        sqlx::query("CREATE TABLE users (id INTEGER PRIMARY KEY)")
+            .execute(&live)
+            .await
+            .unwrap();
+        let qdrant = qdrant_answering(
+            axum::http::StatusCode::NOT_FOUND,
+            r#"{"status":{"error":"Not found: collection `rag_documents` doesn't exist!"}}"#,
+        )
+        .await;
+
+        let err = create_backup(
+            &live,
+            "",
+            &qdrant,
+            "rag_documents",
+            d.path().join("backups").to_str().unwrap(),
+            0,
+        )
+        .await
+        .expect_err("a Qdrant that refuses the snapshot must abort the backup");
+
+        let reported = format!("{err:#}");
+        assert!(
+            reported.contains("404"),
+            "the status must survive into the report, got: {reported}"
+        );
+        assert!(
+            !reported.contains("error decoding response body"),
+            "the serde error must not be what the operator reads, got: {reported}"
+        );
+        // Still a hard failure rather than the survivable "Qdrant did not
+        // answer" case: a refusal is an answer.
+        assert!(
+            !is_qdrant_unreachable(&err),
+            "a status error is not an unreachable Qdrant"
+        );
+    }
 
     fn fake_archive(dir: &Path, name: &str) {
         std::fs::write(dir.join(name), b"not really an archive").unwrap();
