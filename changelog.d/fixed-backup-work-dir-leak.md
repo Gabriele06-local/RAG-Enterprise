@@ -6,4 +6,6 @@
   only deletes what the listing returned, so a leftover stayed outside the
   quota indefinitely. On a volume filling up because of the leak, the failures
   then fed themselves. The directory is now owned by a guard that removes it on
-  every exit, successful or not.
+  every exit, successful or not, and a pack that fails part-way also removes its
+  half-written archive, which the listing would otherwise have offered for
+  restore.
