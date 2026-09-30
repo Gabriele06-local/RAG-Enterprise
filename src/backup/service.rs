@@ -38,11 +38,28 @@ pub async fn create_backup(
     let ts = Utc::now().format("%Y%m%d_%H%M%S").to_string();
     let (work_dir, archive_path) = backup_run_paths(dir, &ts);
     std::fs::create_dir_all(&work_dir)?;
+    // Owns work_dir from here on, so every failure below cleans up after
+    // itself. It holds a whole copy of the database and possibly a
+    // multi-hundred-megabyte Qdrant snapshot, and nothing else reclaims it:
+    // list_backups only matches `*.tar.gz`, and prune_old_backups only
+    // deletes what that listing returned, so a leaked work directory is
+    // outside both the listing and the retention quota. On a volume that is
+    // filling up because of the leak, the failures then become
+    // self-sustaining - which is the opposite of what a backup should do when
+    // the disk is tight.
+    let _work_dir_guard = RemoveDirOnDrop(work_dir.clone());
 
     // 1. SQLite: VACUUM INTO for a WAL-safe consistent snapshot, then ask
     //    SQLite whether what came out is actually a sound database.
     let sqlite_dest = work_dir.join("rag_users.db");
-    sqlx::query(&format!("VACUUM INTO '{}'", sqlite_dest.display()))
+    // VACUUM INTO takes a string literal, not a bound parameter, and SQLite has
+    // no backslash escape: an apostrophe in the path terminated the literal
+    // there and the statement failed. So any deployment under, say,
+    // C:\Users\O'Neill\... or an iCloud/OneDrive folder with one could not be
+    // backed up at all - and from the 02:00 scheduler the only symptom was a
+    // single error line a day. Escaped exactly as restore_sqlite below does.
+    let sqlite_dest_literal = sqlite_dest.display().to_string().replace('\'', "''");
+    sqlx::query(&format!("VACUUM INTO '{sqlite_dest_literal}'"))
         .execute(db)
         .await
         .with_context(|| format!("VACUUM INTO {}", sqlite_dest.display()))?;
@@ -92,11 +109,15 @@ pub async fn create_backup(
     )
     .context("writing backup.json")?;
 
-    // 4. Pack work_dir into a tar.gz archive
-    pack_tar_gz(&work_dir, &archive_path)?;
-
-    // 5. Remove the temp work directory
-    let _ = std::fs::remove_dir_all(&work_dir);
+    // 4. Pack work_dir into a tar.gz archive. The archive file exists from
+    //    the first byte written, so a failure here leaves a half-written
+    //    `.tar.gz` that the listing would offer for restore and retention
+    //    would count as a backup: remove it before reporting the error. The
+    //    guard above still takes the work directory.
+    if let Err(e) = pack_tar_gz(&work_dir, &archive_path) {
+        let _ = std::fs::remove_file(&archive_path);
+        return Err(e);
+    }
 
     tracing::info!(
         archive = %archive_path.display(),
@@ -197,6 +218,33 @@ fn is_qdrant_unreachable(e: &anyhow::Error) -> bool {
 /// interleaving their work dirs and having the second silently overwrite
 /// the first's archive. The short random suffix makes every run unique
 /// while keeping the timestamp prefix the listing sorts on.
+/// Owns a backup's work directory: dropping it removes the directory, so
+/// every early return cleans up without a `remove_dir_all` on each path.
+///
+/// The same shape as `RemoveOnDrop` in api/documents.rs, for the same
+/// reason. Drop is not async, so this is the one `std::fs` call left on the
+/// path; a recursive unlink is metadata work rather than a transfer, so the
+/// executor stall is syscalls and not the size of the payload.
+struct RemoveDirOnDrop(PathBuf);
+
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.0) {
+            // Not the run's failure: by the time this runs the archive may
+            // already be written, and the caller must not be told the backup
+            // failed because a leftover directory could not be deleted. But
+            // that directory holds a full copy of the database, so it is
+            // worth saying out loud.
+            tracing::warn!(
+                path = %self.0.display(),
+                error = %e,
+                "backup work directory could not be removed: it holds a full copy of \
+                 the database and no retention pass will reclaim it"
+            );
+        }
+    }
+}
+
 fn backup_run_paths(dir: &Path, ts: &str) -> (PathBuf, PathBuf) {
     let uniq = &uuid::Uuid::new_v4().simple().to_string()[..8];
     let stem = format!("backup_{ts}_{uniq}");
@@ -211,7 +259,23 @@ fn pack_tar_gz(src: &Path, dest: &Path) -> Result<()> {
     let mut tar = tar::Builder::new(gz);
     tar.append_dir_all(".", src)
         .with_context(|| format!("tar append {}", src.display()))?;
-    tar.finish()?;
+    // finish() writes the tar end-of-archive marker and nothing else: the
+    // gzip stream is finalised by GzEncoder, and letting that happen in Drop
+    // threw the result away (`impl Drop for GzEncoder { try_finish() }`, whose
+    // error is discarded). A volume that filled during the last few KB
+    // therefore produced a truncated gzip that still decompressed to a
+    // perfectly plausible tar prefix, and this returned Ok - so the run logged
+    // "backup complete" and went on to prune, and the corrupt archive - the
+    // newest, so pinned first - was what the listing offered to restore while
+    // the good archives behind it were deleted.
+    let gz = tar.into_inner().context("finishing the tar stream")?;
+    // finish() writes the deflate final block and the CRC32/ISIZE trailer,
+    // and reports a write that failed doing so. Then sync: the point of a
+    // backup is that the bytes are on the disk, not only in the page cache,
+    // and nothing else here would notice a write that never landed.
+    let file = gz.finish().context("finishing the gzip stream")?;
+    file.sync_all()
+        .with_context(|| format!("flushing the archive {}", dest.display()))?;
     Ok(())
 }
 
@@ -589,6 +653,17 @@ fn unpack_tar_gz(archive: &Path, dest: &Path) -> Result<()> {
             .unpack(&out)
             .with_context(|| format!("extracting {}", path.display()))?;
     }
+
+    // Reaching the tar end-of-archive marker does not finish the gzip stream:
+    // flate2 has still not read the CRC32/ISIZE trailer. So a stream cut short
+    // after the tar was complete - which is exactly what a failed
+    // finalisation on the writing side produces - unpacked "successfully", and
+    // the members that had made it were silently all the archive contained.
+    // Draining the decoder to EOF is what proves the archive is whole: a
+    // missing or mismatched trailer surfaces as a read error here.
+    let mut gz = tar.into_inner();
+    std::io::copy(&mut gz, &mut std::io::sink())
+        .context("the archive's gzip stream is truncated or its checksum does not match")?;
     Ok(())
 }
 
@@ -877,7 +952,201 @@ mod tests {
         assert_eq!(list_backups(backup_dir.to_str().unwrap()).await.len(), 2);
     }
 
+    /// A backup directory whose path contains an apostrophe. `VACUUM INTO`
+    /// takes a string literal and SQLite has no backslash escape, so the
+    /// unescaped path ended the literal at the quote and the whole backup
+    /// failed - for every run, from a path a user chooses.
+    #[tokio::test]
+    async fn a_backup_directory_containing_an_apostrophe_still_works() {
+        let d = tempfile::tempdir().unwrap();
+        let live = pool_at(&d.path().join("live.db")).await;
+        sqlx::query("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+            .execute(&live)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO users (id, name) VALUES (1, 'O''Neill')")
+            .execute(&live)
+            .await
+            .unwrap();
+
+        let backup_dir = d.path().join("O'Neill's backups");
+        let archive = create_backup(
+            &live,
+            "",
+            // Port 9: nothing listens, so this takes the database-only path
+            // without needing a Qdrant.
+            "http://127.0.0.1:9",
+            "rag_documents",
+            backup_dir.to_str().unwrap(),
+            0,
+        )
+        .await
+        .expect("a path with an apostrophe must not break the backup");
+        assert!(archive.is_file(), "{}", archive.display());
+
+        // And the copy really is a sound database holding the row.
+        let copy = d.path().join("checked.db");
+        std::fs::create_dir(&copy).unwrap();
+        unpack_tar_gz(&archive, &copy).unwrap();
+        let restored = pool_at(&copy.join("rag_users.db")).await;
+        let name: String = sqlx::query_scalar("SELECT name FROM users WHERE id = 1")
+            .fetch_one(&restored)
+            .await
+            .unwrap();
+        assert_eq!(name, "O'Neill");
+    }
+
+    /// The archive is a gzip stream, and its trailer is only written when the
+    /// encoder is finalised — which used to happen in `Drop`, where the error
+    /// is discarded. So a failure in the last few KB produced a truncated
+    /// stream that still decompressed to a plausible tar prefix, and
+    /// `pack_tar_gz` returned `Ok`.
+    ///
+    /// Nothing read a packed archive back: `two_backups_in_a_row…` only checks
+    /// `is_file()`. This one unpacks what `create_backup` produced and reads
+    /// the manifest and the database out of it, which fails on a stream whose
+    /// trailer is missing.
+    #[tokio::test]
+    async fn the_archive_packed_is_one_that_can_be_read_back() {
+        let d = tempfile::tempdir().unwrap();
+        let live = pool_at(&d.path().join("live.db")).await;
+        sqlx::query("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+            .execute(&live)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO users (id, name) VALUES (1, 'Ada')")
+            .execute(&live)
+            .await
+            .unwrap();
+
+        let archive = create_backup(
+            &live,
+            "",
+            "http://127.0.0.1:9",
+            "rag_documents",
+            d.path().join("backups").to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+
+        let out = d.path().join("unpacked");
+        std::fs::create_dir(&out).unwrap();
+        unpack_tar_gz(&archive, &out).expect("the archive we just wrote must unpack");
+
+        let manifest: BackupManifest =
+            serde_json::from_slice(&std::fs::read(out.join(MANIFEST_FILE)).unwrap()).unwrap();
+        assert_eq!(manifest.format, MANIFEST_FORMAT);
+        assert_eq!(manifest.sqlite.size, std::fs::metadata(out.join("rag_users.db")).unwrap().len());
+
+        // Losing the tail is what a failed gzip finalisation on the writing
+        // side looks like on disk: the tar inside is complete, the container
+        // is not. Reading the members is not enough to notice - the trailer is
+        // only consulted once the stream is drained.
+        let whole = std::fs::read(&archive).unwrap();
+        let cut = whole.len() - 4;
+        std::fs::write(&archive, &whole[..cut]).unwrap();
+        let out2 = d.path().join("unpacked2");
+        std::fs::create_dir(&out2).unwrap();
+        let err = unpack_tar_gz(&archive, &out2)
+            .expect_err("an archive whose gzip trailer is missing must not read as complete");
+        assert!(format!("{err:#}").contains("gzip stream is truncated"), "{err:#}");
+    }
+
     // ── retention ───────────────────────────────────────────────────────────
+
+    /// A Qdrant that answers with an error: the snapshot is unverifiable, so
+    /// the run aborts *after* the work directory holds a complete copy of the
+    /// database. That directory has to go with the failure, because nothing
+    /// else will: `list_backups` only matches `*.tar.gz`, and
+    /// `prune_old_backups` only deletes what the listing returned, so a
+    /// leftover `backup_<ts>_<uniq>/` sits outside the retention quota
+    /// forever.
+    ///
+    /// Returns the address of a server that answers 500 to everything.
+    async fn qdrant_answering_500() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                axum::Router::new().fallback(|| async {
+                    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "no snapshot for you")
+                }),
+            )
+            .await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// Entries in the backup directory that are not archives, i.e. leftovers.
+    fn work_dirs_left_in(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.ends_with(".tar.gz"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_failed_backup_does_not_leave_its_work_directory_behind() {
+        let d = tempfile::tempdir().unwrap();
+        let live = pool_at(&d.path().join("live.db")).await;
+        sqlx::query("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+            .execute(&live)
+            .await
+            .unwrap();
+        let qdrant = qdrant_answering_500().await;
+        let backup_dir = d.path().join("backups");
+
+        let result = create_backup(
+            &live,
+            "",
+            &qdrant,
+            "rag_documents",
+            backup_dir.to_str().unwrap(),
+            0,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a Qdrant that answers 500 must abort the backup"
+        );
+        // Nothing published, so no archive either.
+        assert!(list_backups(backup_dir.to_str().unwrap()).await.is_empty());
+        assert_eq!(
+            work_dirs_left_in(&backup_dir),
+            Vec::<String>::new(),
+            "a failed backup left its work directory - a full copy of the database - \
+             where neither the listing nor retention will ever see it"
+        );
+    }
+
+    /// The same directory is also gone after a success, so the guard did not
+    /// simply move the cleanup somewhere that stops running.
+    #[tokio::test]
+    async fn a_successful_backup_leaves_only_its_archive() {
+        let d = tempfile::tempdir().unwrap();
+        let live = pool_at(&d.path().join("live.db")).await;
+        sqlx::query("CREATE TABLE users (id INTEGER PRIMARY KEY)")
+            .execute(&live)
+            .await
+            .unwrap();
+        let backup_dir = d.path().join("backups");
+        let archive = create_backup(
+            &live,
+            "",
+            "http://127.0.0.1:9",
+            "rag_documents",
+            backup_dir.to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+        assert!(archive.is_file());
+        assert_eq!(work_dirs_left_in(&backup_dir), Vec::<String>::new());
+    }
 
     /// A Qdrant that answers every snapshot request with `status` and `body`.
     /// Binds a random port and serves until the test ends.
@@ -941,7 +1210,6 @@ mod tests {
             "a status error is not an unreachable Qdrant"
         );
     }
-
     fn fake_archive(dir: &Path, name: &str) {
         std::fs::write(dir.join(name), b"not really an archive").unwrap();
     }
