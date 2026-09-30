@@ -114,6 +114,16 @@ pub async fn create_backup(
     //    `.tar.gz` that the listing would offer for restore and retention
     //    would count as a backup: remove it before reporting the error. The
     //    guard above still takes the work directory.
+    //
+    //    Taken under PRUNE_LOCK, which the retention pass below then reuses
+    //    rather than taking again. The archive has to be written inside the
+    //    critical section, not just pruned inside it: a competing run that
+    //    lists and deletes between this write and our own pass sees an
+    //    archive it does not know about, and with a small retain_last it is
+    //    the one that goes - after which this run pins nothing, returns
+    //    Ok(archive_path), and the admin is told a backup exists at a path
+    //    that has just been deleted.
+    let _serialized = PRUNE_LOCK.lock().await;
     if let Err(e) = pack_tar_gz(&work_dir, &archive_path) {
         let _ = std::fs::remove_file(&archive_path);
         return Err(e);
@@ -126,19 +136,22 @@ pub async fn create_backup(
     );
 
     // 5. Retention, success-only: a failed backup must never delete older
-    // archives, and a pruning failure must never fail the backup. The
-    // archive we just wrote is named explicitly so this run can never
-    // prune its own output — see `prune_old_backups`.
+    //    archives, and a pruning failure must never fail the backup. The
+    //    archive we just wrote is named explicitly so this run can never
+    //    prune its own output — see `prune_old_backups`.
     let just_written = archive_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
-    prune_old_backups(backup_dir, retain_last, just_written).await;
+    prune_old_backups(backup_dir, retain_last, just_written, &_serialized).await;
+    drop(_serialized);
 
     Ok(archive_path)
 }
 
-/// Held for the whole of one retention pass — see `prune_old_backups`.
+/// Held from before one run writes its archive until its own retention pass
+/// has finished, so list-and-delete never overlaps another run's write — see
+/// `create_backup` and `prune_old_backups`.
 static PRUNE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Delete `backup_*` archives beyond the newest `retain_last`, oldest
@@ -146,14 +159,16 @@ static PRUNE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// foreign `.tar.gz` sitting in the same directory is left alone; removal
 /// failures are logged, never propagated.
 ///
-/// Retention passes are serialized against each other. Two runs finishing
-/// together — the 02:00 cron tick and an admin "Run Backup Now" — would
-/// otherwise each list the same pair of archives, each pin a *different*
-/// `just_written` to the front, and each delete the other's, leaving no
-/// backup at all. Listing and the deletions it implies are therefore one
-/// critical section. A process-wide lock is enough: the two callers are the
-/// scheduler task and the admin handler inside one process, and startup
-/// kills any stale instance of the same binary before serving.
+/// Retention passes are serialized against each other, and so is the write
+/// they follow. Two runs finishing together — the 02:00 cron tick and an admin
+/// "Run Backup Now" — would otherwise each list the same pair of archives, each
+/// pin a *different* `just_written` to the front, and each delete the other's,
+/// leaving no backup at all. Listing and the deletions it implies are therefore
+/// one critical section, and `create_backup` takes the same lock *before* it
+/// writes, so a pass can never delete an archive another run is in the middle
+/// of producing. A process-wide lock is enough: the two callers are the
+/// scheduler task and the admin handler inside one process, and startup kills
+/// any stale instance of the same binary before serving.
 ///
 /// `just_written` is the archive the calling run has just produced, and it
 /// always survives. That is not redundant with "keep the newest": the
@@ -165,11 +180,20 @@ static PRUNE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// sort below it and, with a small `retain_last`, delete the archive it had
 /// just created while still returning its path to the caller. Pass an empty
 /// name when there is no such archive to protect.
-async fn prune_old_backups(backup_dir: &str, retain_last: u64, just_written: &str) {
+///
+/// `held` is the caller's guard on `PRUNE_LOCK`, taken before its write: the
+/// lock is deliberately not taken here as well, since a second acquisition
+/// would deadlock on itself.
+async fn prune_old_backups(
+    backup_dir: &str,
+    retain_last: u64,
+    just_written: &str,
+    held: &tokio::sync::MutexGuard<'_, ()>,
+) {
     if retain_last == 0 {
         return;
     }
-    let _serialized = PRUNE_LOCK.lock().await;
+    let _held = held;
     // Only our own prefix counts toward the quota: a foreign `.tar.gz`
     // sitting in the same directory must neither be deleted nor consume a
     // retained slot. `list_backups` already sorts newest first, and the
@@ -1198,8 +1222,73 @@ mod tests {
 
     // ── retention ───────────────────────────────────────────────────────────
 
+    /// A run must never hand back a path to a file that is already gone. The
+    /// write was outside the retention lock, so a competing run could list
+    /// and delete in the window between this run's pack and its own pass,
+    /// take the fresh archive with it, and leave this run returning `Ok` for a
+    /// path that no longer exists — the admin endpoint answering
+    /// `{"ok": true}` for a backup that was just deleted.
+    ///
+    /// The check is made inside each task, immediately after the call
+    /// returns: that is the moment the claim is made, and with the lock held a
+    /// second run cannot have reached its own pass yet. Asserting it after
+    /// joining both would be wrong — with `retain_last = 1` a *later* run
+    /// pruning the earlier archive is the policy working, not a fault.
+    ///
+    /// A handful of rounds, not a hundred: each one is two whole backups, and
+    /// the collision needs only a scheduler tick and a double-clicked button.
+    #[tokio::test]
+    async fn a_run_never_returns_a_path_already_deleted_by_a_competing_run() {
+        for round in 0..6 {
+            let d = tempfile::tempdir().unwrap();
+            let live = pool_at(&d.path().join("live.db")).await;
+            sqlx::query("CREATE TABLE users (id INTEGER PRIMARY KEY)")
+                .execute(&live)
+                .await
+                .unwrap();
+            let backup_dir = path_of(&d);
+            let (p1, p2) = (backup_dir.clone(), backup_dir.clone());
+            let (b1, b2) = (live.clone(), live.clone());
+
+            // retain_last = 1, so whichever run prunes second removes the
+            // other's archive - which is exactly the collision.
+            let run = |db: SqlitePool, dir: String| async move {
+                let archive =
+                    create_backup(&db, "", "http://127.0.0.1:9", "rag_documents", &dir, 1)
+                        .await
+                        .expect("the run itself must succeed");
+                (archive.display().to_string(), archive.is_file())
+            };
+            let a = tokio::spawn(run(b1, p1));
+            let b = tokio::spawn(run(b2, p2));
+            let (one, two) = tokio::join!(a, b);
+
+            for (path, there) in [one.unwrap(), two.unwrap()] {
+                assert!(
+                    there,
+                    "round {round}: a run returned {path}, which was already gone: a \
+                     competing run pruned it between the write and the retention pass"
+                );
+            }
+            // And the policy itself still holds: two runs, one kept.
+            assert_eq!(
+                list_backups(&backup_dir).await.len(),
+                1,
+                "round {round}: retain_last = 1 over two runs must leave one archive"
+            );
+        }
+    }
+
     fn fake_archive(dir: &Path, name: &str) {
         std::fs::write(dir.join(name), b"not really an archive").unwrap();
+    }
+
+    /// One retention pass, taken the way `create_backup` takes it: the lock
+    /// first, then the pass. A test that called the pass without the lock
+    /// would not be exercising the ordering the real run has.
+    async fn prune(dir: &str, retain_last: u64, just_written: &str) {
+        let held = PRUNE_LOCK.lock().await;
+        prune_old_backups(dir, retain_last, just_written, &held).await;
     }
 
     fn path_of(dir: &tempfile::TempDir) -> String {
@@ -1212,7 +1301,7 @@ mod tests {
         for n in 1..=3 {
             fake_archive(dir.path(), &format!("backup_2026010{n}_000000_aaa{n}1111.tar.gz"));
         }
-        prune_old_backups(dir.path().to_str().unwrap(), 0, "").await;
+        prune(dir.path().to_str().unwrap(), 0, "").await;
         assert_eq!(list_backups(dir.path().to_str().unwrap()).await.len(), 3);
     }
 
@@ -1223,7 +1312,7 @@ mod tests {
             fake_archive(dir.path(), &format!("backup_2026010{n}_000000_aaa{n}1111.tar.gz"));
         }
         fake_archive(dir.path(), "someone-elses-archive.tar.gz");
-        prune_old_backups(
+        prune(
             dir.path().to_str().unwrap(),
             2,
             "backup_20260104_000000_aaa41111.tar.gz",
@@ -1271,7 +1360,7 @@ mod tests {
         fake_archive(dir.path(), older);
         fake_archive(dir.path(), just_written);
 
-        prune_old_backups(dir.path().to_str().unwrap(), 1, just_written).await;
+        prune(dir.path().to_str().unwrap(), 1, just_written).await;
 
         assert_eq!(
             list_backups(dir.path().to_str().unwrap()).await,
@@ -1295,8 +1384,8 @@ mod tests {
             fake_archive(dir.path(), two);
 
             let (p1, p2) = (path_of(&dir), path_of(&dir));
-            let a = tokio::spawn(async move { prune_old_backups(&p1, 1, one).await });
-            let b = tokio::spawn(async move { prune_old_backups(&p2, 1, two).await });
+            let a = tokio::spawn(async move { prune(&p1, 1, one).await });
+            let b = tokio::spawn(async move { prune(&p2, 1, two).await });
             let _ = tokio::join!(a, b);
 
             assert_eq!(
