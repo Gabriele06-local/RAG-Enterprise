@@ -941,10 +941,11 @@ mod tests {
         let whole = std::fs::read(&archive).unwrap();
         let cut = whole.len() - 4;
         std::fs::write(&archive, &whole[..cut]).unwrap();
-        assert!(
-            unpack_tar_gz(&archive, &d.path().join("unpacked2")).is_err(),
-            "an archive whose gzip trailer is missing must not read as complete"
-        );
+        let out2 = d.path().join("unpacked2");
+        std::fs::create_dir(&out2).unwrap();
+        let err = unpack_tar_gz(&archive, &out2)
+            .expect_err("an archive whose gzip trailer is missing must not read as complete");
+        assert!(format!("{err:#}").contains("gzip stream is truncated"), "{err:#}");
     }
 
     // ── retention ───────────────────────────────────────────────────────────
