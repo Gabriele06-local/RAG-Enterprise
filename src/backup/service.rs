@@ -102,11 +102,15 @@ pub async fn create_backup(
     )
     .context("writing backup.json")?;
 
-    // 4. Pack work_dir into a tar.gz archive. Until this returns the archive
-    //    does not exist, so a failure here leaves nothing to keep - and the
-    //    guard above still has the work directory, whose deletion is exactly
-    //    what a half-written run must not leave behind.
-    pack_tar_gz(&work_dir, &archive_path)?;
+    // 4. Pack work_dir into a tar.gz archive. The archive file exists from
+    //    the first byte written, so a failure here leaves a half-written
+    //    `.tar.gz` that the listing would offer for restore and retention
+    //    would count as a backup: remove it before reporting the error. The
+    //    guard above still takes the work directory.
+    if let Err(e) = pack_tar_gz(&work_dir, &archive_path) {
+        let _ = std::fs::remove_file(&archive_path);
+        return Err(e);
+    }
 
     tracing::info!(
         archive = %archive_path.display(),
