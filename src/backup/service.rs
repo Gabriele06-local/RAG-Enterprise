@@ -542,7 +542,7 @@ pub async fn restore_backup(
     // is written. A damaged archive stops here, with the installation
     // untouched, instead of being discovered halfway through the restore.
     let mut report = RestoreReport::default();
-    match verify_unpacked(tmp.path())? {
+    let manifest = match verify_unpacked(tmp.path())? {
         Some(manifest) => {
             tracing::info!(
                 created = %manifest.created,
@@ -556,15 +556,53 @@ pub async fn restore_backup(
                      the documents will not come back, only the database"
                 );
             }
+            Some(manifest)
         }
-        None => tracing::warn!(
-            archive = archive_name,
-            "archive written before 0.1.27: it carries no manifest, so its contents cannot be \
-             verified before being restored"
-        ),
+        None => {
+            tracing::warn!(
+                archive = archive_name,
+                "archive written before 0.1.27: it carries no manifest, so its contents cannot be \
+                 verified before being restored"
+            );
+            None
+        }
+    };
+
+    // The member names come from the manifest, the same ones verify_unpacked
+    // just hashed. Reconstructing them from the current configuration instead -
+    // which is what this used to do - is how a restore ended up verifying one
+    // set of files and applying another: rename QDRANT__COLLECTION, or move
+    // the archive to another install, and the snapshot is verified under the
+    // name it was taken with but then looked for under the one configured now.
+    // It was not found, the run reported success, and only the database came
+    // back.
+    let sqlite_name = manifest
+        .as_ref()
+        .map(|m| m.sqlite.file.clone())
+        .unwrap_or_else(|| "rag_users.db".to_owned());
+    let snapshot_name = manifest
+        .as_ref()
+        .and_then(|m| m.qdrant.as_ref().map(|q| q.file.clone()))
+        .unwrap_or_else(|| format!("{qdrant_collection}.snapshot"));
+
+    // And an archive of a different collection is refused outright rather than
+    // applied to this one: uploading another collection's snapshot under this
+    // name would put vectors in the wrong place, which is worse than not
+    // restoring them. Nothing above this point has been written yet.
+    if let Some(taken_from) = manifest
+        .as_ref()
+        .and_then(|m| m.qdrant_collection.as_deref())
+    {
+        if taken_from != qdrant_collection {
+            anyhow::bail!(
+                "this archive holds the Qdrant collection {taken_from:?}, but this \
+                 installation is configured for {qdrant_collection:?}: restoring it would put \
+                 the vectors in the wrong collection. Nothing has been restored."
+            );
+        }
     }
 
-    let snapshot = tmp.path().join(format!("{qdrant_collection}.snapshot"));
+    let snapshot = tmp.path().join(&snapshot_name);
     if snapshot.is_file() {
         upload_qdrant_snapshot(qdrant_url, qdrant_collection, &snapshot)
             .await
@@ -578,13 +616,17 @@ pub async fn restore_backup(
         );
     }
 
-    let sqlite = tmp.path().join("rag_users.db");
-    if sqlite.is_file() {
-        let (tables, rows) = restore_sqlite(db, &sqlite).await?;
-        tracing::info!(tables = tables.len(), rows, "SQLite restored");
-        report.sqlite_tables = tables;
-        report.sqlite_rows = rows;
+    let sqlite = tmp.path().join(&sqlite_name);
+    if !sqlite.is_file() {
+        // Reported as success before, with nothing in the log to say so: a
+        // restore that restored no database is not a restore, and the report
+        // it returned claimed otherwise.
+        anyhow::bail!("the archive contains no {sqlite_name}: nothing was restored");
     }
+    let (tables, rows) = restore_sqlite(db, &sqlite).await?;
+    tracing::info!(tables = tables.len(), rows, "SQLite restored");
+    report.sqlite_tables = tables;
+    report.sqlite_rows = rows;
 
     Ok(report)
 }
@@ -1423,6 +1465,238 @@ mod tests {
             .filename(path)
             .create_if_missing(true);
         SqlitePool::connect_with(opts).await.unwrap()
+    }
+
+    /// An archive whose manifest says exactly this: a sound copy of `live` at
+    /// `sqlite_name`, an optional snapshot at `snapshot_name`, and the
+    /// collection it was taken from. Built by hand rather than through
+    /// `create_backup` so a restore can be pointed at a configuration the
+    /// archive was not taken under.
+    async fn archive_with_manifest(
+        live: &SqlitePool,
+        backup_dir: &Path,
+        sqlite_name: &str,
+        snapshot_name: Option<&str>,
+        collection: Option<&str>,
+    ) -> String {
+        let work = backup_dir.join("work");
+        std::fs::create_dir(&work).unwrap();
+        // VACUUM INTO a fixed name and then rename: the manifest may claim a
+        // different one, and the point is that the manifest decides.
+        let real = work.join("real.db");
+        sqlx::query(&format!("VACUUM INTO '{}'", real.display()))
+            .execute(live)
+            .await
+            .unwrap();
+        let digest = digest_of(&real).unwrap();
+        std::fs::rename(&real, work.join(sqlite_name)).unwrap();
+        let sqlite = MemberDigest {
+            file: sqlite_name.to_owned(),
+            ..digest
+        };
+
+        let qdrant = snapshot_name.map(|name| {
+            std::fs::write(work.join(name), b"not a real snapshot").unwrap();
+            let digest = digest_of(&work.join(name)).unwrap();
+            MemberDigest {
+                file: name.to_owned(),
+                ..digest
+            }
+        });
+
+        let manifest = BackupManifest {
+            format: MANIFEST_FORMAT,
+            created: Utc::now().to_rfc3339(),
+            engine_version: "test".to_owned(),
+            sqlite,
+            qdrant,
+            qdrant_collection: collection.map(str::to_owned),
+        };
+        std::fs::write(
+            work.join(MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let archive = backup_dir.join("archive.tar.gz");
+        pack_tar_gz(&work, &archive).unwrap();
+        archive.file_name().unwrap().to_str().unwrap().to_owned()
+    }
+
+    /// The manifest names the collection the snapshot was taken from, and a
+    /// restore into a differently-configured one used to verify the archive
+    /// and then quietly restore half of it: the snapshot was hashed under the
+    /// name it was written with, and then looked for under the name this
+    /// installation is configured for. Not found, warning logged, the run
+    /// reported success, and only the database came back. An archive of
+    /// another collection is refused instead, before anything is written.
+    #[tokio::test]
+    async fn an_archive_of_another_collection_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let live = pool_at(&d.path().join("live.db")).await;
+        sqlx::query("CREATE TABLE documents (id INTEGER PRIMARY KEY)")
+            .execute(&live)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO documents (id) VALUES (1)")
+            .execute(&live)
+            .await
+            .unwrap();
+        let backup_dir = d.path().join("backups");
+        std::fs::create_dir(&backup_dir).unwrap();
+        let archive = archive_with_manifest(
+            &live,
+            &backup_dir,
+            "rag_users.db",
+            Some("rag_documents.snapshot"),
+            Some("rag_documents"),
+        )
+        .await;
+
+        // This installation points at a different collection now.
+        let err = restore_backup(
+            &live,
+            "http://127.0.0.1:9",
+            "rag_docs_v2",
+            backup_dir.to_str().unwrap(),
+            &archive,
+        )
+        .await
+        .expect_err("an archive of another collection must not be applied to this one");
+        let reported = format!("{err:#}");
+        assert!(reported.contains("rag_documents"), "{reported}");
+        assert!(reported.contains("rag_docs_v2"), "{reported}");
+
+        // And nothing was restored: the live row is still the only one.
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM documents")
+            .fetch_one(&live)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "a refused restore must not touch the database");
+    }
+
+    /// The same archive under its own collection name is applied, so the check
+    /// above is not simply refusing every archive with a snapshot in it.
+    #[tokio::test]
+    async fn an_archive_of_this_collection_is_applied() {
+        let d = tempfile::tempdir().unwrap();
+        let live = pool_at(&d.path().join("live.db")).await;
+        sqlx::query("CREATE TABLE documents (id INTEGER PRIMARY KEY)")
+            .execute(&live)
+            .await
+            .unwrap();
+        let backup_dir = d.path().join("backups");
+        std::fs::create_dir(&backup_dir).unwrap();
+        let archive = archive_with_manifest(
+            &live,
+            &backup_dir,
+            "rag_users.db",
+            Some("rag_documents.snapshot"),
+            Some("rag_documents"),
+        )
+        .await;
+
+        // No Qdrant: the upload fails, which is enough to show the check let
+        // the restore through to the point of trying.
+        let err = restore_backup(
+            &live,
+            "http://127.0.0.1:9",
+            "rag_documents",
+            backup_dir.to_str().unwrap(),
+            &archive,
+        )
+        .await
+        .expect_err("nothing listens on port 9, so the upload cannot succeed");
+        assert!(
+            !format!("{err:#}").contains("wrong collection"),
+            "a matching collection must not be refused: {err:#}"
+        );
+    }
+
+    /// The manifest is also what says where the database is. Reconstructing the
+    /// name from the current configuration meant a manifest-less or renamed
+    /// member was verified under one name and then applied as though it were
+    /// not there at all - and, because the branch had no `else`, that was
+    /// reported as a successful restore of nothing.
+    #[tokio::test]
+    async fn the_manifest_decides_where_the_database_is_looked_for() {
+        let d = tempfile::tempdir().unwrap();
+        let live = pool_at(&d.path().join("live.db")).await;
+        sqlx::query("CREATE TABLE documents (id INTEGER PRIMARY KEY)")
+            .execute(&live)
+            .await
+            .unwrap();
+        let backup_dir = d.path().join("backups");
+        std::fs::create_dir(&backup_dir).unwrap();
+        // A member name nothing but the manifest knows.
+        let archive = archive_with_manifest(&live, &backup_dir, "accounts.db", None, None).await;
+
+        let report = restore_backup(
+            &live,
+            "http://127.0.0.1:9",
+            "rag_documents",
+            backup_dir.to_str().unwrap(),
+            &archive,
+        )
+        .await
+        .expect("a manifest that names the member is the authority on where it is");
+        assert!(report.verified);
+        assert_eq!(
+            report.sqlite_tables,
+            vec!["documents".to_string()],
+            "the database the manifest names must be the one restored"
+        );
+    }
+
+    /// And an archive with no database in it is not a restore. It used to be
+    /// reported as a success with an empty report and nothing in the log.
+    #[tokio::test]
+    async fn an_archive_with_no_database_is_an_error_not_a_successful_restore() {
+        let d = tempfile::tempdir().unwrap();
+        let live = pool_at(&d.path().join("live.db")).await;
+        sqlx::query("CREATE TABLE documents (id INTEGER PRIMARY KEY)")
+            .execute(&live)
+            .await
+            .unwrap();
+        let backup_dir = d.path().join("backups");
+        std::fs::create_dir(&backup_dir).unwrap();
+        let archive = archive_with_manifest(&live, &backup_dir, "accounts.db", None, None).await;
+
+        // Empty the archive of what the manifest promises, which is what
+        // verify_unpacked is there to catch - here by passing the digest of a
+        // file it never wrote, so the failure is unambiguous.
+        let work = backup_dir.join("broken");
+        std::fs::create_dir(&work).unwrap();
+        let manifest = BackupManifest {
+            format: MANIFEST_FORMAT,
+            created: Utc::now().to_rfc3339(),
+            engine_version: "test".to_owned(),
+            sqlite: MemberDigest {
+                file: "absent.db".to_owned(),
+                sha256: "0".repeat(64),
+                size: 1,
+            },
+            qdrant: None,
+            qdrant_collection: None,
+        };
+        std::fs::write(
+            work.join(MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        pack_tar_gz(&work, &backup_dir.join("broken.tar.gz")).unwrap();
+        let broken = "broken.tar.gz".to_owned();
+        let _ = archive;
+
+        let err = restore_backup(
+            &live,
+            "http://127.0.0.1:9",
+            "rag_documents",
+            backup_dir.to_str().unwrap(),
+            &broken,
+        )
+        .await
+        .expect_err("an archive without the database it promises is damaged, not restorable");
+        assert!(format!("{err:#}").contains("absent.db"), "{err:#}");
     }
 
     #[tokio::test]
