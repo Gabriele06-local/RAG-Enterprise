@@ -379,6 +379,34 @@ async fn create_qdrant_snapshot(
         ),
     }
 
+    // Now that our copy is proven, the copy Qdrant kept is not needed again.
+    // Nothing in this project deletes it: `retain_last` prunes local tarballs
+    // only, so every daily backup left a whole collection-sized snapshot in
+    // the Qdrant host's snapshots/ directory, growing without bound until that
+    // volume filled - and then the snapshot POST began failing, which aborts
+    // the backup the caller asked for. The backup subsystem filling the disk it
+    // is trying to protect.
+    //
+    // Best-effort, and deliberately after the verification above: an
+    // unverified download must leave the server-side copy in place so the run
+    // can be retried. A failure here is worth saying out loud - the space is
+    // still held - but it is not a backup failure, and must not fail one.
+    match http
+        .delete(&dl_url)
+        .send()
+        .await
+        .context("deleting the server-side Qdrant snapshot")?
+        .error_for_status()
+    {
+        Ok(_) => tracing::info!(snapshot = %snap_name, "server-side Qdrant snapshot removed"),
+        Err(e) => tracing::warn!(
+            snapshot = %snap_name,
+            error = %e,
+            "the server-side Qdrant snapshot could not be removed: it is still taking up \
+             space in the Qdrant host, and no retention pass will reclaim it"
+        ),
+    }
+
     Ok(digest)
 }
 
@@ -1197,6 +1225,73 @@ mod tests {
     }
 
     // ── retention ───────────────────────────────────────────────────────────
+
+    /// A Qdrant that hands out a real, verifiable snapshot and records whether
+    /// it was asked to delete it afterwards.
+    async fn qdrant_serving_a_snapshot(
+        deleted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> (String, Vec<u8>) {
+        let bytes = b"not a real snapshot, but a real one to checksum".to_vec();
+        let sha = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(&bytes))
+        };
+        let size = bytes.len() as u64;
+        let meta = serde_json::json!({
+            "result": { "name": "backup.snapshot", "size": size, "checksum": sha }
+        });
+        let meta_body = meta.to_string();
+        let body = bytes.clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let serve = move |method: axum::http::Method| {
+                let deleted = deleted.clone();
+                let body = body.clone();
+                let meta_body = meta_body.clone();
+                async move {
+                    let payload = match method {
+                        axum::http::Method::POST => meta_body,
+                        axum::http::Method::DELETE => {
+                            deleted.store(true, std::sync::atomic::Ordering::SeqCst);
+                            String::new()
+                        }
+                        _ => String::from_utf8_lossy(&body).into_owned(),
+                    };
+                    (axum::http::StatusCode::OK, payload)
+                }
+            };
+            let _ = axum::serve(listener, axum::Router::new().fallback(serve)).await;
+        });
+        (format!("http://{addr}"), bytes)
+    }
+
+    /// Qdrant keeps a copy of every snapshot it creates, and nothing in this
+    /// project deleted it: `retain_last` prunes local tarballs only. So each
+    /// daily backup added a collection-sized snapshot to the Qdrant host,
+    /// growing without bound until that volume filled - and then the snapshot
+    /// POST started failing, which aborts the very backup meant to protect
+    /// against exactly this. The copy on the Qdrant host is dropped once ours
+    /// is verified.
+    #[tokio::test]
+    async fn the_snapshot_is_deleted_from_qdrant_once_ours_is_verified() {
+        let d = tempfile::tempdir().unwrap();
+        let deleted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (qdrant, bytes) = qdrant_serving_a_snapshot(deleted.clone()).await;
+        let dest = d.path().join("work");
+        std::fs::create_dir(&dest).unwrap();
+
+        let digest = create_qdrant_snapshot(&qdrant, "rag_documents", &dest)
+            .await
+            .expect("the snapshot we served verifies against its own checksum");
+        assert_eq!(digest.size, bytes.len() as u64);
+        assert!(
+            deleted.load(std::sync::atomic::Ordering::SeqCst),
+            "the snapshot Qdrant kept was never deleted, so every backup leaves another \
+             one on its host"
+        );
+    }
 
     fn fake_archive(dir: &Path, name: &str) {
         std::fs::write(dir.join(name), b"not really an archive").unwrap();
