@@ -905,6 +905,7 @@ mod tests {
 
         // And the copy really is a sound database holding the row.
         let copy = d.path().join("checked.db");
+        std::fs::create_dir(&copy).unwrap();
         unpack_tar_gz(&archive, &copy).unwrap();
         let restored = pool_at(&copy.join("rag_users.db")).await;
         let name: String = sqlx::query_scalar("SELECT name FROM users WHERE id = 1")
