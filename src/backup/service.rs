@@ -926,6 +926,7 @@ mod tests {
         .unwrap();
 
         let out = d.path().join("unpacked");
+        std::fs::create_dir(&out).unwrap();
         unpack_tar_gz(&archive, &out).expect("the archive we just wrote must unpack");
 
         let manifest: BackupManifest =
