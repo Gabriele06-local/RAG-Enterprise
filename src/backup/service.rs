@@ -125,7 +125,7 @@ pub async fn create_backup(
         "backup complete"
     );
 
-    // 6. Retention, success-only: a failed backup must never delete older
+    // 5. Retention, success-only: a failed backup must never delete older
     // archives, and a pruning failure must never fail the backup. The
     // archive we just wrote is named explicitly so this run can never
     // prune its own output — see `prune_old_backups`.
@@ -209,15 +209,6 @@ fn is_qdrant_unreachable(e: &anyhow::Error) -> bool {
     })
 }
 
-/// Work dir + archive path for one backup run inside `dir`.
-///
-/// Split out so the uniqueness rule is testable without running a whole
-/// backup. `ts` has one-second granularity, which is NOT unique: two runs
-/// started in the same second (a double-clicked "Run Backup Now", a manual
-/// run landing on the 02:00 cron tick) would otherwise share both paths,
-/// interleaving their work dirs and having the second silently overwrite
-/// the first's archive. The short random suffix makes every run unique
-/// while keeping the timestamp prefix the listing sorts on.
 /// Owns a backup's work directory: dropping it removes the directory, so
 /// every early return cleans up without a `remove_dir_all` on each path.
 ///
@@ -245,6 +236,15 @@ impl Drop for RemoveDirOnDrop {
     }
 }
 
+/// Work dir + archive path for one backup run inside `dir`.
+///
+/// Split out so the uniqueness rule is testable without running a whole
+/// backup. `ts` has one-second granularity, which is NOT unique: two runs
+/// started in the same second (a double-clicked "Run Backup Now", a manual
+/// run landing on the 02:00 cron tick) would otherwise share both paths,
+/// interleaving their work dirs and having the second silently overwrite
+/// the first's archive. The short random suffix makes every run unique
+/// while keeping the timestamp prefix the listing sorts on.
 fn backup_run_paths(dir: &Path, ts: &str) -> (PathBuf, PathBuf) {
     let uniq = &uuid::Uuid::new_v4().simple().to_string()[..8];
     let stem = format!("backup_{ts}_{uniq}");
@@ -891,7 +891,7 @@ mod tests {
         assert!(resolve_archive(d.path().to_str().unwrap(), "absent.tar.gz").is_err());
     }
 
-    // ── backup run paths ────────────────────────────────────────────────────
+    // ── backup runs ─────────────────────────────────────────────────────────
 
     /// Same timestamp twice must still yield different paths: one-second
     /// granularity is not unique across runs.
@@ -1053,26 +1053,15 @@ mod tests {
         assert!(format!("{err:#}").contains("gzip stream is truncated"), "{err:#}");
     }
 
-    // ── retention ───────────────────────────────────────────────────────────
-
-    /// A Qdrant that answers with an error: the snapshot is unverifiable, so
-    /// the run aborts *after* the work directory holds a complete copy of the
-    /// database. That directory has to go with the failure, because nothing
-    /// else will: `list_backups` only matches `*.tar.gz`, and
-    /// `prune_old_backups` only deletes what the listing returned, so a
-    /// leftover `backup_<ts>_<uniq>/` sits outside the retention quota
-    /// forever.
-    ///
-    /// Returns the address of a server that answers 500 to everything.
-    async fn qdrant_answering_500() -> String {
+    /// A Qdrant that answers every snapshot request with `status` and `body`.
+    /// Binds a random port and serves until the test ends.
+    async fn qdrant_answering(status: axum::http::StatusCode, body: &'static str) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let _ = axum::serve(
                 listener,
-                axum::Router::new().fallback(|| async {
-                    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "no snapshot for you")
-                }),
+                axum::Router::new().fallback(move || async move { (status, body) }),
             )
             .await;
         });
@@ -1089,6 +1078,13 @@ mod tests {
             .collect()
     }
 
+    /// A Qdrant that answers 500: the snapshot is unverifiable, so the run
+    /// aborts *after* the work directory holds a complete copy of the
+    /// database. That directory has to go with the failure, because nothing
+    /// else will: `list_backups` only matches `*.tar.gz`, and
+    /// `prune_old_backups` only deletes what the listing returned, so a
+    /// leftover `backup_<ts>_<uniq>/` sits outside the retention quota
+    /// forever.
     #[tokio::test]
     async fn a_failed_backup_does_not_leave_its_work_directory_behind() {
         let d = tempfile::tempdir().unwrap();
@@ -1097,7 +1093,11 @@ mod tests {
             .execute(&live)
             .await
             .unwrap();
-        let qdrant = qdrant_answering_500().await;
+        let qdrant = qdrant_answering(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "no snapshot for you",
+        )
+        .await;
         let backup_dir = d.path().join("backups");
 
         let result = create_backup(
@@ -1148,21 +1148,6 @@ mod tests {
         assert_eq!(work_dirs_left_in(&backup_dir), Vec::<String>::new());
     }
 
-    /// A Qdrant that answers every snapshot request with `status` and `body`.
-    /// Binds a random port and serves until the test ends.
-    async fn qdrant_answering(status: axum::http::StatusCode, body: &'static str) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(
-                listener,
-                axum::Router::new().fallback(move || async move { (status, body) }),
-            )
-            .await;
-        });
-        format!("http://{addr}")
-    }
-
     /// A snapshot that cannot be taken has to say which HTTP status said so.
     /// The body Qdrant sends for a missing collection is a JSON error object,
     /// which is not a `SnapshotResult`, so before the status was checked the
@@ -1210,6 +1195,9 @@ mod tests {
             "a status error is not an unreachable Qdrant"
         );
     }
+
+    // ── retention ───────────────────────────────────────────────────────────
+
     fn fake_archive(dir: &Path, name: &str) {
         std::fs::write(dir.join(name), b"not really an archive").unwrap();
     }
