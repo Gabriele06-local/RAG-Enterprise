@@ -93,7 +93,16 @@ jobs:
       - name: Committed bundle matches the source
         working-directory: .
         run: |
-          if ! git diff --exit-code --stat -- frontend/dist; then
+          # `git add -A` first, then --cached. `git diff` alone reports nothing
+          # for an untracked file, and the bundle is content-hashed: a source
+          # change normally shows up as the *deletion* of the old hash, which
+          # git diff does see. But a dist that gained a file without losing one
+          # - a build run and `git add`ed without the stale hash removed, or a
+          # file placed there by hand - is invisible, and that pull request
+          # passed with a frontend/dist that no build produces, which is the
+          # half of the guarantee above about nobody being able to review it.
+          git add -A -- frontend/dist
+          if ! git diff --exit-code --stat --cached -- frontend/dist; then
             echo "::error::frontend/dist does not match frontend/src." \
                  "Run 'npm ci && npm run build' in frontend/ and commit the result."
             exit 1
