@@ -395,8 +395,7 @@ async fn create_qdrant_snapshot(
         .delete(&dl_url)
         .send()
         .await
-        .context("deleting the server-side Qdrant snapshot")?
-        .error_for_status()
+        .and_then(|resp| resp.error_for_status())
     {
         Ok(_) => tracing::info!(snapshot = %snap_name, "server-side Qdrant snapshot removed"),
         Err(e) => tracing::warn!(
