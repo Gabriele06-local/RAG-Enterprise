@@ -1223,8 +1223,6 @@ mod tests {
         );
     }
 
-    // ── retention ───────────────────────────────────────────────────────────
-
     /// A Qdrant that hands out a real, verifiable snapshot and records whether
     /// it was asked to delete it afterwards.
     async fn qdrant_serving_a_snapshot(
