@@ -159,8 +159,10 @@ fn is_bad_request(e: &anyhow::Error) -> bool {
         "archive not found",
         // unpack_tar_gz
         "archive entry escapes the destination",
+        "archive entry is not a regular file or directory",
         "the archive's gzip stream",
         // verify_unpacked
+        "parsing backup.json",
         "this archive is in backup format",
         "not a plain file name",
         "the archive promises",
