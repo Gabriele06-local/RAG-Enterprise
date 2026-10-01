@@ -627,13 +627,6 @@ pub async fn restore_backup(
         );
     }
 
-    let sqlite = tmp.path().join(&sqlite_name);
-    if !sqlite.is_file() {
-        // Reported as success before, with nothing in the log to say so: a
-        // restore that restored no database is not a restore, and the report
-        // it returned claimed otherwise.
-        anyhow::bail!("the archive contains no {sqlite_name}: nothing was restored");
-    }
     let (tables, rows) = restore_sqlite(db, &sqlite).await?;
     tracing::info!(tables = tables.len(), rows, "SQLite restored");
     report.sqlite_tables = tables;
