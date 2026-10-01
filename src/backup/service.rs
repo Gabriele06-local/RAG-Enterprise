@@ -831,19 +831,54 @@ async fn restore_sqlite(db: &SqlitePool, src: &Path) -> Result<(Vec<String>, u64
 
     let result = copy_tables(&mut conn).await;
 
+    // The three statements below put the connection back the way it was found.
+    // They were best-effort only while they succeed: if the ROLLBACK fails -
+    // the same SQLITE_BUSY or SQLITE_FULL that made the copy fail - the write
+    // transaction is still open, the DETACH cannot succeed while a transaction
+    // is open, and `PRAGMA foreign_keys = ON` is a silent no-op inside one.
+    // Handing that back would put a connection into the pool holding the
+    // RESERVED lock with foreign-key enforcement off, which is exactly what
+    // these lines exist to prevent, and every later user of that connection
+    // would inherit both with nothing to show why.
+    //
+    // So each step is checked, and a connection that could not be put back is
+    // closed rather than returned.
+    let mut dirty = false;
     if result.is_err() {
-        // Undo the half-written copy before handing the connection back:
-        // without this the pool inherits an open write transaction holding
-        // the RESERVED lock, and the next operation on that connection —
-        // including a retried restore, which cannot BEGIN inside it — fails
-        // with a confusing error far from the actual cause.
-        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+        // Undo the half-written copy before anything else: without this the
+        // next operation on that connection - including a retried restore,
+        // which cannot BEGIN inside an open transaction - fails with a
+        // confusing error far from the actual cause.
+        if let Err(e) = sqlx::query("ROLLBACK").execute(&mut *conn).await {
+            tracing::error!(
+                error = %e,
+                "the restore's ROLLBACK failed: the connection is being closed rather than \
+                 returned to the pool, since it still holds an open write transaction"
+            );
+            dirty = true;
+        }
     }
 
-    // Restore connection state whatever happened, so the connection is safe to
-    // hand back to the pool.
-    let _ = sqlx::query("DETACH DATABASE backup").execute(&mut *conn).await;
-    let _ = sqlx::query("PRAGMA foreign_keys = ON").execute(&mut *conn).await;
+    for statement in ["DETACH DATABASE backup", "PRAGMA foreign_keys = ON"] {
+        if let Err(e) = sqlx::query(statement).execute(&mut *conn).await {
+            tracing::error!(
+                statement,
+                error = %e,
+                "a restore connection could not be put back the way it was found"
+            );
+            dirty = true;
+        }
+    }
+    if dirty {
+        // The restore's own result is what the caller gets either way: a close
+        // that fails as well is worth the log line, not a different error.
+        if let Err(e) = conn.close().await {
+            tracing::error!(
+                error = %e,
+                "closing a restore connection that could not be reset failed as well"
+            );
+        }
+    }
 
     result
 }
