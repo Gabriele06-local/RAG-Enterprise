@@ -584,6 +584,17 @@ pub async fn restore_backup(
         .as_ref()
         .and_then(|m| m.qdrant.as_ref().map(|q| q.file.clone()))
         .unwrap_or_else(|| format!("{qdrant_collection}.snapshot"));
+    // The names come out of the archive, so they are held to the rule an
+    // archive name from an HTTP body is: a plain file name. A manifest naming
+    // `../x` or an absolute path would otherwise point the restore at a file
+    // anywhere on the host, now that the restore applies what it names.
+    for name in [&sqlite_name, &snapshot_name] {
+        let plain = Path::new(name).components().collect::<Vec<_>>().as_slice()
+            == [Component::Normal(name.as_ref())];
+        if !plain {
+            anyhow::bail!("the archive's manifest names {name:?}, which is not a plain file name");
+        }
+    }
 
     // And an archive of a different collection is refused outright rather than
     // applied to this one: uploading another collection's snapshot under this
