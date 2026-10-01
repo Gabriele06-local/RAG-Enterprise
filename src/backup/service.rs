@@ -800,8 +800,15 @@ fn is_safe_entry_path(path: &Path) -> bool {
 /// HTTP body, and the same rule the restore applies to the member names a
 /// manifest carries. All three are strings from outside the program, and each
 /// is joined onto a directory this code then reads.
+///
+/// A backslash is refused outright: it is a separator on Windows and an
+/// ordinary character everywhere else, so allowing it would let the same name
+/// be a child on one platform and a path on another. None of the names this
+/// code produces contains one.
 fn is_plain_file_name(name: &str) -> bool {
-    Path::new(name).components().collect::<Vec<_>>().as_slice() == [Component::Normal(name.as_ref())]
+    !name.contains('\\')
+        && Path::new(name).components().collect::<Vec<_>>().as_slice()
+            == [Component::Normal(name.as_ref())]
 }
 
 async fn upload_qdrant_snapshot(qdrant_url: &str, collection: &str, snapshot: &Path) -> Result<()> {
