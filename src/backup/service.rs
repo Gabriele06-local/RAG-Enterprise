@@ -1292,6 +1292,8 @@ mod tests {
         );
     }
 
+    // ── retention ───────────────────────────────────────────────────────────
+
     fn fake_archive(dir: &Path, name: &str) {
         std::fs::write(dir.join(name), b"not really an archive").unwrap();
     }
