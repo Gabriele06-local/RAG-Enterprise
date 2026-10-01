@@ -613,6 +613,17 @@ pub async fn restore_backup(
         }
     }
 
+    // The database is looked for before anything is written. A manifest always
+    // promises it, and verify_unpacked has made sure it is there, but an archive
+    // from before 0.1.27 carries no manifest: finding its database missing only
+    // after the snapshot upload would leave the vectors replaced and the
+    // database not, while reporting that nothing was restored. (It used to be
+    // reported as a success, with an empty report and nothing in the log.)
+    let sqlite = tmp.path().join(&sqlite_name);
+    if !sqlite.is_file() {
+        anyhow::bail!("the archive contains no {sqlite_name}: nothing was restored");
+    }
+
     let snapshot = tmp.path().join(&snapshot_name);
     if snapshot.is_file() {
         upload_qdrant_snapshot(qdrant_url, qdrant_collection, &snapshot)
