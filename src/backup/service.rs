@@ -527,6 +527,19 @@ fn verify_unpacked(dir: &Path) -> Result<Option<BackupManifest>> {
     }
 
     for member in std::iter::once(&manifest.sqlite).chain(manifest.qdrant.iter()) {
+        // The name comes out of the archive, so it is held to being a plain
+        // file name before it is joined: an absolute path would make `join`
+        // throw the base away and point the digest at a file anywhere on the
+        // host, and its size and sha256 would then be reported in the mismatch
+        // message below - an oracle for the content of any file this process
+        // can read, reachable by anyone who can hand the admin a .tar.gz. The
+        // restore applies the same rule to the same two names.
+        if !is_plain_file_name(&member.file) {
+            anyhow::bail!(
+                "the archive's manifest names {:?}, which is not a plain file name",
+                member.file
+            );
+        }
         let path = dir.join(&member.file);
         if !path.is_file() {
             anyhow::bail!("the archive promises {} but does not contain it", member.file);
@@ -640,9 +653,7 @@ pub async fn restore_backup(
     // `../x` or an absolute path would otherwise point the restore at a file
     // anywhere on the host, now that the restore applies what it names.
     for name in [&sqlite_name, &snapshot_name] {
-        let plain = Path::new(name).components().collect::<Vec<_>>().as_slice()
-            == [Component::Normal(name.as_ref())];
-        if !plain {
+        if !is_plain_file_name(name) {
             anyhow::bail!("the archive's manifest names {name:?}, which is not a plain file name");
         }
     }
@@ -703,9 +714,7 @@ pub async fn restore_backup(
 /// carrying a separator or a parent component could point the unpacker at an
 /// arbitrary file on the host.
 fn resolve_archive(backup_dir: &str, name: &str) -> Result<PathBuf> {
-    let is_plain_file_name =
-        Path::new(name).components().collect::<Vec<_>>().as_slice() == [Component::Normal(name.as_ref())];
-    if !is_plain_file_name {
+    if !is_plain_file_name(name) {
         anyhow::bail!("invalid archive name: {name:?}");
     }
     if !name.ends_with(".tar.gz") {
@@ -781,6 +790,25 @@ fn is_safe_entry_path(path: &Path) -> bool {
         && path
             .components()
             .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
+/// A name is a plain file name when joining it onto a directory can only ever
+/// produce a child of that directory: one `Normal` component, so no separator,
+/// no `..`, and nothing `join` would treat as absolute.
+///
+/// The same rule as `resolve_archive` applies to an archive name arriving in an
+/// HTTP body, and the same rule the restore applies to the member names a
+/// manifest carries. All three are strings from outside the program, and each
+/// is joined onto a directory this code then reads.
+///
+/// A backslash is refused outright: it is a separator on Windows and an
+/// ordinary character everywhere else, so allowing it would let the same name
+/// be a child on one platform and a path on another. None of the names this
+/// code produces contains one.
+fn is_plain_file_name(name: &str) -> bool {
+    !name.contains('\\')
+        && Path::new(name).components().collect::<Vec<_>>().as_slice()
+            == [Component::Normal(name.as_ref())]
 }
 
 async fn upload_qdrant_snapshot(qdrant_url: &str, collection: &str, snapshot: &Path) -> Result<()> {
@@ -1972,6 +2000,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ids, [1], "nothing from the other database may reach the live one");
+    }
+
+    /// The other half of the same rule, on the side that runs first. The
+    /// restore refuses a name that is not a plain file name, but only after
+    /// `verify_unpacked` has already resolved and **hashed** it — and an
+    /// absolute path makes `join` throw the base away. The digest of whatever
+    /// that pointed at is then reported in the mismatch message, so a
+    /// hand-delivered archive could be used to read the size and sha256 of any
+    /// file this process can open.
+    ///
+    /// So the name is checked where it is first consumed. Asserted on the
+    /// digest *not* appearing, which is the part that was leaking.
+    #[tokio::test]
+    async fn verification_does_not_read_a_file_the_manifest_points_outside_at() {
+        let d = tempfile::tempdir().unwrap();
+        let secret = d.path().join("host-file.db");
+        std::fs::write(&secret, b"a secret the archive has no business hashing").unwrap();
+        let secret_digest = digest_of(&secret).unwrap();
+
+        // An unpacked archive whose manifest promises that absolute path, with
+        // its digest supplied correctly so the mismatch branch is the one
+        // reached.
+        let dir = d.path().join("unpacked");
+        std::fs::create_dir(&dir).unwrap();
+        let manifest = BackupManifest {
+            format: MANIFEST_FORMAT,
+            created: Utc::now().to_rfc3339(),
+            engine_version: "test".to_owned(),
+            sqlite: MemberDigest {
+                file: secret.to_str().unwrap().to_owned(),
+                ..secret_digest.clone()
+            },
+            qdrant: None,
+            qdrant_collection: None,
+        };
+        std::fs::write(
+            dir.join(MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let err = verify_unpacked(&dir)
+            .expect_err("a manifest naming a file outside the archive must be refused");
+        let reported = format!("{err:#}");
+        assert!(
+            reported.contains("not a plain file name"),
+            "the name must be refused as such: {reported}"
+        );
+        assert!(
+            !reported.contains(&secret_digest.sha256),
+            "the digest of a file outside the archive leaked into the report: {reported}"
+        );
+    }
+
+    /// The rule itself, so it is stated once and tested once.
+    #[test]
+    fn a_plain_file_name_has_no_separator_no_parent_and_is_not_absolute() {
+        for plain in ["backup.tar.gz", "rag_users.db", "a", "x.tar.gz"] {
+            assert!(is_plain_file_name(plain), "{plain:?}");
+        }
+        for hostile in [
+            "",
+            ".",
+            "..",
+            "../x",
+            "a/b",
+            "a\\b",
+            "/etc/passwd",
+            "./x",
+            "C:\\x",
+        ] {
+            assert!(!is_plain_file_name(hostile), "{hostile:?}");
+        }
     }
 
     #[tokio::test]
