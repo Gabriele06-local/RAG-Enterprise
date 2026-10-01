@@ -762,9 +762,14 @@ async fn restore_sqlite(db: &SqlitePool, src: &Path) -> Result<(Vec<String>, u64
         }
     }
     if dirty {
-        conn.close()
-            .await
-            .context("closing a restore connection that could not be reset")?;
+        // The restore's own result is what the caller gets either way: a close
+        // that fails as well is worth the log line, not a different error.
+        if let Err(e) = conn.close().await {
+            tracing::error!(
+                error = %e,
+                "closing a restore connection that could not be reset failed as well"
+            );
+        }
     }
 
     result
