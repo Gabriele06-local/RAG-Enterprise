@@ -125,18 +125,53 @@ pub async fn restore_backup(
     .await
     {
         Ok(report) => Json(json!({ "ok": true, "restored": report })).into_response(),
-        // A bad archive name is the caller's mistake, not a server fault; every
-        // other failure happened while restoring and is ours.
+        // A bad archive - the name, or the archive itself - is the caller's
+        // mistake, not a server fault. Every other failure happened while
+        // restoring and is ours.
         Err(e) if is_bad_request(&e) => err(StatusCode::BAD_REQUEST, e),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
 }
 
+/// Whether the restore failed because of the archive or the name it was given,
+/// rather than because of us.
+///
+/// The archive's own failures are the caller's to fix - wrong name, damaged or
+/// truncated tarball, a digest that does not match, a member missing, a
+/// manifest naming something outside the archive, a snapshot belonging to a
+/// collection this installation is not configured for. Reporting those as 5xx
+/// was not merely a wrong status: `err` deliberately withholds a 5xx's message
+/// from the caller, so an admin who picked the wrong archive, or restored one
+/// taken from another collection, was told "internal server error" and nothing
+/// about which archive or why.
+///
+/// Matched against the whole chain, not `e.to_string()`: that is only the
+/// outermost context, so any `.context()` added above one of these in the
+/// service would silently demote a 4xx to a 5xx with the message hidden. The
+/// test below holds every refusal the service can produce here, so a new one
+/// has to be classified deliberately rather than by omission.
 fn is_bad_request(e: &anyhow::Error) -> bool {
-    let msg = e.to_string();
-    msg.starts_with("invalid archive name")
-        || msg.starts_with("not a backup archive")
-        || msg.starts_with("archive not found")
+    let msg = format!("{e:#}");
+    const CALLER_FAULT: &[&str] = &[
+        // resolve_archive
+        "invalid archive name",
+        "not a backup archive",
+        "archive not found",
+        // unpack_tar_gz
+        "archive entry escapes the destination",
+        "archive entry is not a regular file or directory",
+        "the archive's gzip stream",
+        // verify_unpacked
+        "parsing backup.json",
+        "this archive is in backup format",
+        "not a plain file name",
+        "the archive promises",
+        "does not match the archive's own manifest",
+        // restore_backup
+        "the archive contains no",
+        "holds the Qdrant collection",
+    ];
+    CALLER_FAULT.iter().any(|reason| msg.contains(reason))
 }
 
 // ── GET /api/admin/qdrant/stats ───────────────────────────────────────────────
@@ -238,28 +273,55 @@ mod tests {
         anyhow::anyhow!("{msg}")
     }
 
-    /// The three prefix strings must stay in sync with
-    /// backup::service::resolve_archive: a drift here misclassifies a
-    /// caller error as a 500.
+    /// Every refusal backup::service can produce about the archive or the name
+    /// it was given, held here so a drift misclassifying a caller error as a
+    /// 500 shows up as a failing test rather than as an admin told
+    /// "internal server error".
     #[test]
     fn caller_errors_are_recognised() {
         for msg in [
+            // resolve_archive
             "invalid archive name: \"../x.tar.gz\"",
             "not a backup archive: \"rag_users.db\"",
             "archive not found: absent.tar.gz",
+            // unpack_tar_gz
+            "archive entry escapes the destination: x",
+            "archive entry is not a regular file or directory: link",
+            "the archive's gzip stream is truncated or its checksum does not match",
+            // verify_unpacked
+            "parsing backup.json: expected value at line 1 column 1",
+            "this archive is in backup format 9 and was written by a newer engine (x)",
+            "the archive's manifest names \"/etc/passwd\", which is not a plain file name",
+            "the archive promises rag_users.db but does not contain it",
+            "rag_users.db does not match the archive's own manifest - the backup is damaged",
+            // restore_backup
+            "the archive contains no rag_users.db: nothing was restored",
+            "this archive holds the Qdrant collection \"old\", but this installation is \
+             configured for \"new\"",
         ] {
             assert!(is_bad_request(&bad(msg)), "msg={msg:?}");
         }
     }
 
+    /// And ours, which must keep their 5xx - and with it the withheld message.
     #[test]
     fn server_faults_are_not_recognised() {
         for msg in [
-            "archive entry escapes the destination: x",
             "the Qdrant snapshot could not be verified, backup aborted",
+            "the Qdrant snapshot is corrupt: expected sha256 aa, got bb",
             "internal server error",
+            "",
         ] {
             assert!(!is_bad_request(&bad(msg)), "msg={msg:?}");
         }
+    }
+
+    /// The classification reads the whole chain, so a `.context()` added above
+    /// one of these in the service cannot quietly demote a 4xx into a 5xx with
+    /// the message withheld.
+    #[test]
+    fn a_wrapped_caller_error_is_still_a_caller_error() {
+        let wrapped = bad("invalid archive name: \"x\"").context("restoring backup");
+        assert!(is_bad_request(&wrapped), "{wrapped:#}");
     }
 }
