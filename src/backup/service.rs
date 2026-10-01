@@ -82,10 +82,28 @@ pub async fn create_backup(
     {
         Ok(digest) => Some(digest),
         Err(e) if is_qdrant_unreachable(&e) => {
+            // The message has to say which of the two things happened, because
+            // they need different responses: Qdrant being down is a "retry
+            // later", a transfer that broke half way is "the network between us
+            // and Qdrant is dropping connections", and reporting the second as
+            // the first sends the operator to restart a service that was up and
+            // answering the whole time. `is_request` is reqwest's catch-all for
+            // "something went wrong sending this", and a connect or timeout is
+            // also one of those - so only a request error that is neither is
+            // the transfer breaking.
+            let dropped = e
+                .chain()
+                .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
+                .any(|r| r.is_request() && !(r.is_connect() || r.is_timeout()));
             tracing::error!(
                 error = %e,
-                "Qdrant did not answer: writing a database-only backup. It will NOT restore \
-                 your documents — take another one once Qdrant is back."
+                "Qdrant {}: writing a database-only backup. It will NOT restore your documents \
+                 - take another one once this is sorted.",
+                if dropped {
+                    "started answering and then dropped the connection"
+                } else {
+                    "did not answer"
+                },
             );
             let _ = std::fs::remove_file(work_dir.join(format!("{qdrant_collection}.snapshot")));
             None
@@ -1197,6 +1215,60 @@ mod tests {
     }
 
     // ── retention ───────────────────────────────────────────────────────────
+
+    /// `is_qdrant_unreachable` treats a transfer that broke half way as
+    /// survivable, which is the right call — the backup is still worth writing
+    /// — but it is not the same thing as Qdrant being down, and the operator is
+    /// told which one it was: a service that is up and dropping connections
+    /// needs a different response from one that is not answering at all.
+    ///
+    /// A raw listener is what makes this reproducible: it writes a
+    /// `Content-Length` far larger than the body it then sends and closes, so
+    /// the request succeeds and the body read fails — a request error that is
+    /// neither a connect nor a timeout, which is the case the message used to
+    /// report as "did not answer".
+    #[tokio::test]
+    async fn a_download_cut_short_is_told_apart_from_qdrant_being_down() {
+        let dest = tempfile::tempdir().unwrap();
+        // A port nothing listens on: the connection itself fails.
+        let down = create_qdrant_snapshot("http://127.0.0.1:9", "rag_documents", dest.path())
+            .await
+            .expect_err("nothing is listening on port 9");
+        assert!(
+            is_qdrant_unreachable(&down),
+            "a refused connection is survivable"
+        );
+
+        // A server that answers and then drops before sending what it promised.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\n{\"result\":")
+                        .await;
+                    // ...and the connection ends here, mid-body.
+                });
+            }
+        });
+        let cut = create_qdrant_snapshot(&format!("http://{addr}"), "rag_documents", dest.path())
+            .await
+            .expect_err("a body that stops short is an error");
+        assert!(
+            is_qdrant_unreachable(&cut),
+            "a transfer cut short is still survivable: the database half is worth keeping"
+        );
+        let dropped = cut
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
+            .any(|r| r.is_request() && !(r.is_connect() || r.is_timeout()));
+        assert!(
+            dropped,
+            "expected a request error that is neither connect nor timeout, got {cut:#}"
+        );
+    }
 
     fn fake_archive(dir: &Path, name: &str) {
         std::fs::write(dir.join(name), b"not really an archive").unwrap();
