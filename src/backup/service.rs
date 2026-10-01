@@ -1651,56 +1651,98 @@ mod tests {
         );
     }
 
-    /// And an archive with no database in it is not a restore. It used to be
-    /// reported as a success with an empty report and nothing in the log.
+    /// An archive with no database in it is not a restore: it used to be
+    /// reported as a success, with an empty report and nothing in the log. And
+    /// it is refused before the snapshot upload - an archive from before 0.1.27
+    /// has no manifest to promise the database, and discovering it missing only
+    /// after the vectors were replaced would leave half a restore behind.
     #[tokio::test]
     async fn an_archive_with_no_database_is_an_error_not_a_successful_restore() {
         let d = tempfile::tempdir().unwrap();
         let live = pool_at(&d.path().join("live.db")).await;
-        sqlx::query("CREATE TABLE documents (id INTEGER PRIMARY KEY)")
-            .execute(&live)
-            .await
-            .unwrap();
         let backup_dir = d.path().join("backups");
-        std::fs::create_dir(&backup_dir).unwrap();
-        let archive = archive_with_manifest(&live, &backup_dir, "accounts.db", None, None).await;
-
-        // Empty the archive of what the manifest promises, which is what
-        // verify_unpacked is there to catch - here by passing the digest of a
-        // file it never wrote, so the failure is unambiguous.
-        let work = backup_dir.join("broken");
-        std::fs::create_dir(&work).unwrap();
-        let manifest = BackupManifest {
-            format: MANIFEST_FORMAT,
-            created: Utc::now().to_rfc3339(),
-            engine_version: "test".to_owned(),
-            sqlite: MemberDigest {
-                file: "absent.db".to_owned(),
-                sha256: "0".repeat(64),
-                size: 1,
-            },
-            qdrant: None,
-            qdrant_collection: None,
-        };
-        std::fs::write(
-            work.join(MANIFEST_FILE),
-            serde_json::to_vec(&manifest).unwrap(),
-        )
-        .unwrap();
-        pack_tar_gz(&work, &backup_dir.join("broken.tar.gz")).unwrap();
-        let broken = "broken.tar.gz".to_owned();
-        let _ = archive;
+        let work = backup_dir.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        // No manifest, as before 0.1.27, and a snapshot but no database.
+        std::fs::write(work.join("rag_documents.snapshot"), b"not a real snapshot").unwrap();
+        pack_tar_gz(&work, &backup_dir.join("legacy.tar.gz")).unwrap();
 
         let err = restore_backup(
             &live,
             "http://127.0.0.1:9",
             "rag_documents",
             backup_dir.to_str().unwrap(),
-            &broken,
+            "legacy.tar.gz",
         )
         .await
-        .expect_err("an archive without the database it promises is damaged, not restorable");
-        assert!(format!("{err:#}").contains("absent.db"), "{err:#}");
+        .expect_err("an archive without a database is not restorable");
+        // Refused for the database, not failed at the upload: nothing listens
+        // on port 9, so reaching the upload would have failed there instead.
+        assert!(format!("{err:#}").contains("rag_users.db"), "{err:#}");
+    }
+
+    /// The manifest is read out of the archive, so the names in it are held to
+    /// the rule an archive name from an HTTP body is: a plain file name. One
+    /// naming an absolute path - here another database on the host, with its
+    /// correct digest, so verification alone lets it through - is refused
+    /// before anything is applied.
+    #[tokio::test]
+    async fn a_manifest_naming_a_file_outside_the_archive_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let live = pool_at(&d.path().join("live.db")).await;
+        sqlx::query("CREATE TABLE documents (id INTEGER PRIMARY KEY)")
+            .execute(&live)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO documents (id) VALUES (1)")
+            .execute(&live)
+            .await
+            .unwrap();
+        // Another database on the same host.
+        let elsewhere = d.path().join("elsewhere.db");
+        let other = pool_at(&elsewhere).await;
+        sqlx::query("CREATE TABLE documents (id INTEGER PRIMARY KEY)")
+            .execute(&other)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO documents (id) VALUES (42)")
+            .execute(&other)
+            .await
+            .unwrap();
+        other.close().await;
+
+        let backup_dir = d.path().join("backups");
+        let work = backup_dir.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let manifest = BackupManifest {
+            format: MANIFEST_FORMAT,
+            created: Utc::now().to_rfc3339(),
+            engine_version: "test".to_owned(),
+            sqlite: MemberDigest {
+                file: elsewhere.to_str().unwrap().to_owned(),
+                ..digest_of(&elsewhere).unwrap()
+            },
+            qdrant: None,
+            qdrant_collection: None,
+        };
+        std::fs::write(work.join(MANIFEST_FILE), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        pack_tar_gz(&work, &backup_dir.join("outside.tar.gz")).unwrap();
+
+        let err = restore_backup(
+            &live,
+            "http://127.0.0.1:9",
+            "rag_documents",
+            backup_dir.to_str().unwrap(),
+            "outside.tar.gz",
+        )
+        .await
+        .expect_err("a manifest naming a file outside the archive must be refused");
+        assert!(format!("{err:#}").contains("not a plain file name"), "{err:#}");
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM documents")
+            .fetch_all(&live)
+            .await
+            .unwrap();
+        assert_eq!(ids, [1], "nothing from the other database may reach the live one");
     }
 
     #[tokio::test]
