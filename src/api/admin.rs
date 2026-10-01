@@ -286,8 +286,10 @@ mod tests {
             "archive not found: absent.tar.gz",
             // unpack_tar_gz
             "archive entry escapes the destination: x",
+            "archive entry is not a regular file or directory: link",
             "the archive's gzip stream is truncated or its checksum does not match",
             // verify_unpacked
+            "parsing backup.json: expected value at line 1 column 1",
             "this archive is in backup format 9 and was written by a newer engine (x)",
             "the archive's manifest names \"/etc/passwd\", which is not a plain file name",
             "the archive promises rag_users.db but does not contain it",
