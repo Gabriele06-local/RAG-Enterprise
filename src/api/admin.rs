@@ -7,6 +7,7 @@
 //! DELETE /api/admin/qdrant/document/{id}   → delete all vectors for a document
 //! GET    /api/admin/sqlite/documents        → all rows (soft-deleted included)
 
+use anyhow::Context;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -192,29 +193,91 @@ pub async fn qdrant_stats(State(state): State<AppState>, claims: Claims) -> Resp
 
 pub async fn qdrant_documents(State(state): State<AppState>, claims: Claims) -> Response {
     if let Some(r) = require_admin(&claims) { return r; }
-    let url = format!(
-        "{}/collections/{}/points/scroll",
-        state.settings.qdrant.url, state.settings.qdrant.collection
-    );
-    let body = json!({ "limit": 10000, "with_payload": true, "with_vector": false });
     let client = reqwest::Client::new();
-    let resp = match client.post(&url).json(&body).send().await {
-        Ok(r) => r,
-        Err(e) => return err(StatusCode::BAD_GATEWAY, e),
-    };
-    let raw: serde_json::Value = match resp.json().await {
-        Ok(v) => v,
-        Err(e) => return err(StatusCode::BAD_GATEWAY, e),
-    };
+    match scroll_all_documents(&client, &state.settings.qdrant.url, &state.settings.qdrant.collection).await {
+        Ok(list) => Json(json!({ "documents": list })).into_response(),
+        Err(e) => err(StatusCode::BAD_GATEWAY, e),
+    }
+}
 
-    // Group by document_id from the payloads.
-    let mut docs: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
-    if let Some(points) = raw.get("result").and_then(|r| r.get("points")).and_then(|p| p.as_array()) {
-        for point in points {
-            if let Some(payload) = point.get("payload") {
-                let doc_id = payload.get("document_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+/// How many points one scroll request asks for.
+const SCROLL_PAGE: usize = 1000;
+
+/// Ceiling on the pages one call will fetch, so a misbehaving or hostile
+/// endpoint that always reports another page cannot spin here forever.
+const SCROLL_MAX_PAGES: usize = 1000;
+
+/// Every document in the collection, with the number of chunks each has.
+///
+/// The scroll is followed to the end. Asking once with a limit and taking what
+/// comes back is the shape this used to have, and it silently truncates: the
+/// limit is in **points**, and a document is a few dozen of those, so a
+/// collection of any size stopped at the first page and the admin's sync check
+/// then reported every document past it as "in SQLite but not in Qdrant" -
+/// documents that are entirely present and entirely fine, listed for deletion.
+async fn scroll_all_documents(
+    client: &reqwest::Client,
+    qdrant_url: &str,
+    collection: &str,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let url = format!("{qdrant_url}/collections/{collection}/points/scroll");
+    let mut docs: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+    let mut offset: Option<usize> = None;
+
+    for _ in 0..SCROLL_MAX_PAGES {
+        let mut body = json!({
+            "limit": SCROLL_PAGE,
+            "with_payload": true,
+            "with_vector": false,
+        });
+        if let Some(at) = offset {
+            body["offset"] = json!(at);
+        }
+        let resp = client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("scrolling the vectors of {collection}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let detail = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Qdrant refused the scroll of {collection} ({status}): {detail}");
+        }
+        let raw: serde_json::Value = resp
+            .json()
+            .await
+            .with_context(|| format!("reading the scroll of {collection}"))?;
+
+        // A page short of the limit is the last one. Qdrant also hands back
+        // `next_page_offset`, and that is the authoritative answer, so it is
+        // preferred and the length is only the fallback for an older build that
+        // omits it.
+        let result = raw.get("result");
+        let points = result
+            .and_then(|r| r.get("points"))
+            .and_then(|p| p.as_array())
+            .map(Vec::len)
+            .unwrap_or(0);
+        let next = result
+            .and_then(|r| r.get("next_page_offset"))
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize);
+        let last = next.is_none() && points < SCROLL_PAGE;
+
+        // Group by document_id from the payloads.
+        if let Some(points) = result
+            .and_then(|r| r.get("points"))
+            .and_then(|p| p.as_array())
+        {
+            for point in points {
+                let Some(payload) = point.get("payload") else {
+                    continue;
+                };
+                let doc_id = payload.get("document_id").and_then(|v| v.as_str()).unwrap_or("");
                 if doc_id.is_empty() { continue; }
-                let entry = docs.entry(doc_id.clone()).or_insert_with(|| json!({
+                let entry = docs.entry(doc_id.to_owned()).or_insert_with(|| json!({
                     "document_id": doc_id,
                     "filename": payload.get("filename").and_then(|v| v.as_str()).unwrap_or(""),
                     "upload_date": payload.get("upload_date").and_then(|v| v.as_str()).unwrap_or(""),
@@ -225,14 +288,20 @@ pub async fn qdrant_documents(State(state): State<AppState>, claims: Claims) -> 
                 }
             }
         }
+
+        match next {
+            Some(at) if !last => offset = Some(at),
+            _ => break,
+        }
     }
+
     let mut list: Vec<serde_json::Value> = docs.into_values().collect();
     list.sort_by(|a, b| {
         let da = a.get("upload_date").and_then(|v| v.as_str()).unwrap_or("");
         let db = b.get("upload_date").and_then(|v| v.as_str()).unwrap_or("");
         db.cmp(da)
     });
-    Json(json!({ "documents": list })).into_response()
+    Ok(list)
 }
 
 // ── DELETE /api/admin/qdrant/document/{id} ────────────────────────────────────
@@ -268,6 +337,91 @@ pub async fn sqlite_documents(State(state): State<AppState>, claims: Claims) -> 
 #[cfg(test)]
 mod tests {
     use super::is_bad_request;
+    use super::scroll_all_documents;
+
+    /// The admin panel's sync check asks Qdrant which documents exist and
+    /// reports any that SQLite has and Qdrant does not. That answer came from
+    /// a single scroll with a fixed limit, so on any collection past it the
+    /// check listed perfectly healthy documents as missing - and the panel
+    /// offers to delete them.
+    ///
+    /// The pages are followed here: the fake answers with one page, then a
+    /// second, then stops.
+    #[tokio::test]
+    async fn the_scroll_is_followed_until_qdrant_says_there_is_no_more() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let read = stream.read(&mut buf).await.unwrap_or(0);
+                    // Which page is being asked for is decided by the request
+                    // body carrying an offset.
+                    let asked_for_second = read > 0
+                        && String::from_utf8_lossy(&buf[..read]).contains("\"offset\"");
+                    let page: serde_json::Value = if asked_for_second {
+                        serde_json::json!({
+                            "result": {
+                                "points": [
+                                    { "payload": { "document_id": "doc-b", "filename": "b.pdf",
+                                                   "upload_date": "2026-01-02T00:00:00Z" } },
+                                    { "payload": { "document_id": "doc-c", "filename": "c.pdf",
+                                                   "upload_date": "2026-01-03T00:00:00Z" } },
+                                ],
+                                "next_page_offset": null,
+                            }
+                        })
+                    } else {
+                        serde_json::json!({
+                            "result": {
+                                "points": [
+                                    { "payload": { "document_id": "doc-a", "filename": "a.pdf",
+                                                   "upload_date": "2026-01-01T00:00:00Z" } },
+                                    { "payload": { "document_id": "doc-b", "filename": "b.pdf",
+                                                   "upload_date": "2026-01-02T00:00:00Z" } },
+                                ],
+                                "next_page_offset": 2,
+                            }
+                        })
+                    };
+                    let body = page.to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        let list = scroll_all_documents(
+            &reqwest::Client::new(),
+            &format!("http://{addr}"),
+            "rag_documents",
+        )
+        .await
+        .expect("both pages");
+        let ids: Vec<&str> = list
+            .iter()
+            .map(|d| d["document_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            ["doc-c", "doc-b", "doc-a"],
+            "newest first, and doc-c is only on the second page"
+        );
+        let chunks = |id: &str| {
+            list.iter()
+                .find(|d| d["document_id"] == id)
+                .unwrap()["chunk_count"]
+                .as_i64()
+                .unwrap()
+        };
+        assert_eq!(chunks("doc-b"), 2, "a document spanning two pages is counted once per chunk");
+    }
 
     fn bad(msg: &str) -> anyhow::Error {
         anyhow::anyhow!("{msg}")
