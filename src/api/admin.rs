@@ -223,7 +223,10 @@ async fn scroll_all_documents(
     let url = format!("{qdrant_url}/collections/{collection}/points/scroll");
     let mut docs: std::collections::HashMap<String, serde_json::Value> =
         std::collections::HashMap::new();
-    let mut offset: Option<usize> = None;
+    // A point id. This project's are UUID strings, and the scroll offset is
+    // whatever the previous page's next_page_offset was, so it is passed back
+    // exactly as Qdrant gave it rather than read as a number.
+    let mut offset: Option<serde_json::Value> = None;
 
     for _ in 0..SCROLL_MAX_PAGES {
         let mut body = json!({
