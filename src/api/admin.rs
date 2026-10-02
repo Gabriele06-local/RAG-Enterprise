@@ -265,8 +265,8 @@ async fn scroll_all_documents(
             .unwrap_or(0);
         let next = result
             .and_then(|r| r.get("next_page_offset"))
-            .and_then(|v| v.as_u64())
-            .map(|n| n as usize);
+            .filter(|v| !v.is_null())
+            .cloned();
         let last = next.is_none() && points < SCROLL_PAGE;
 
         // Group by document_id from the payloads.
