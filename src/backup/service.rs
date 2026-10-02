@@ -114,6 +114,16 @@ pub async fn create_backup(
     //    `.tar.gz` that the listing would offer for restore and retention
     //    would count as a backup: remove it before reporting the error. The
     //    guard above still takes the work directory.
+    //
+    //    Taken under PRUNE_LOCK, which the retention pass below then reuses
+    //    rather than taking again. The archive has to be written inside the
+    //    critical section, not just pruned inside it: a competing run that
+    //    lists and deletes between this write and our own pass sees an
+    //    archive it does not know about, and with a small retain_last it is
+    //    the one that goes - after which this run pins nothing, returns
+    //    Ok(archive_path), and the admin is told a backup exists at a path
+    //    that has just been deleted.
+    let _serialized = PRUNE_LOCK.lock().await;
     if let Err(e) = pack_tar_gz(&work_dir, &archive_path) {
         let _ = std::fs::remove_file(&archive_path);
         return Err(e);
@@ -126,19 +136,22 @@ pub async fn create_backup(
     );
 
     // 5. Retention, success-only: a failed backup must never delete older
-    // archives, and a pruning failure must never fail the backup. The
-    // archive we just wrote is named explicitly so this run can never
-    // prune its own output — see `prune_old_backups`.
+    //    archives, and a pruning failure must never fail the backup. The
+    //    archive we just wrote is named explicitly so this run can never
+    //    prune its own output — see `prune_old_backups`.
     let just_written = archive_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
-    prune_old_backups(backup_dir, retain_last, just_written).await;
+    prune_old_backups(backup_dir, retain_last, just_written, &_serialized).await;
+    drop(_serialized);
 
     Ok(archive_path)
 }
 
-/// Held for the whole of one retention pass — see `prune_old_backups`.
+/// Held from before one run writes its archive until its own retention pass
+/// has finished, so list-and-delete never overlaps another run's write — see
+/// `create_backup` and `prune_old_backups`.
 static PRUNE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Delete `backup_*` archives beyond the newest `retain_last`, oldest
@@ -146,14 +159,16 @@ static PRUNE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// foreign `.tar.gz` sitting in the same directory is left alone; removal
 /// failures are logged, never propagated.
 ///
-/// Retention passes are serialized against each other. Two runs finishing
-/// together — the 02:00 cron tick and an admin "Run Backup Now" — would
-/// otherwise each list the same pair of archives, each pin a *different*
-/// `just_written` to the front, and each delete the other's, leaving no
-/// backup at all. Listing and the deletions it implies are therefore one
-/// critical section. A process-wide lock is enough: the two callers are the
-/// scheduler task and the admin handler inside one process, and startup
-/// kills any stale instance of the same binary before serving.
+/// Retention passes are serialized against each other, and so is the write
+/// they follow. Two runs finishing together — the 02:00 cron tick and an admin
+/// "Run Backup Now" — would otherwise each list the same pair of archives, each
+/// pin a *different* `just_written` to the front, and each delete the other's,
+/// leaving no backup at all. Listing and the deletions it implies are therefore
+/// one critical section, and `create_backup` takes the same lock *before* it
+/// writes, so a pass can never delete an archive another run is in the middle
+/// of producing. A process-wide lock is enough: the two callers are the
+/// scheduler task and the admin handler inside one process, and startup kills
+/// any stale instance of the same binary before serving.
 ///
 /// `just_written` is the archive the calling run has just produced, and it
 /// always survives. That is not redundant with "keep the newest": the
@@ -165,11 +180,20 @@ static PRUNE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// sort below it and, with a small `retain_last`, delete the archive it had
 /// just created while still returning its path to the caller. Pass an empty
 /// name when there is no such archive to protect.
-async fn prune_old_backups(backup_dir: &str, retain_last: u64, just_written: &str) {
+///
+/// `held` is the caller's guard on `PRUNE_LOCK`, taken before its write: the
+/// lock is deliberately not taken here as well, since a second acquisition
+/// would deadlock on itself.
+async fn prune_old_backups(
+    backup_dir: &str,
+    retain_last: u64,
+    just_written: &str,
+    held: &tokio::sync::MutexGuard<'_, ()>,
+) {
     if retain_last == 0 {
         return;
     }
-    let _serialized = PRUNE_LOCK.lock().await;
+    let _held = held;
     // Only our own prefix counts toward the quota: a foreign `.tar.gz`
     // sitting in the same directory must neither be deleted nor consume a
     // retained slot. `list_backups` already sorts newest first, and the
@@ -379,6 +403,33 @@ async fn create_qdrant_snapshot(
         ),
     }
 
+    // Now that our copy is proven, the copy Qdrant kept is not needed again.
+    // Nothing in this project deletes it: `retain_last` prunes local tarballs
+    // only, so every daily backup left a whole collection-sized snapshot in
+    // the Qdrant host's snapshots/ directory, growing without bound until that
+    // volume filled - and then the snapshot POST began failing, which aborts
+    // the backup the caller asked for. The backup subsystem filling the disk it
+    // is trying to protect.
+    //
+    // Best-effort, and deliberately after the verification above: an
+    // unverified download must leave the server-side copy in place so the run
+    // can be retried. A failure here is worth saying out loud - the space is
+    // still held - but it is not a backup failure, and must not fail one.
+    match http
+        .delete(&dl_url)
+        .send()
+        .await
+        .and_then(|resp| resp.error_for_status())
+    {
+        Ok(_) => tracing::info!(snapshot = %snap_name, "server-side Qdrant snapshot removed"),
+        Err(e) => tracing::warn!(
+            snapshot = %snap_name,
+            error = %e,
+            "the server-side Qdrant snapshot could not be removed: it is still taking up \
+             space in the Qdrant host, and no retention pass will reclaim it"
+        ),
+    }
+
     Ok(digest)
 }
 
@@ -476,6 +527,19 @@ fn verify_unpacked(dir: &Path) -> Result<Option<BackupManifest>> {
     }
 
     for member in std::iter::once(&manifest.sqlite).chain(manifest.qdrant.iter()) {
+        // The name comes out of the archive, so it is held to being a plain
+        // file name before it is joined: an absolute path would make `join`
+        // throw the base away and point the digest at a file anywhere on the
+        // host, and its size and sha256 would then be reported in the mismatch
+        // message below - an oracle for the content of any file this process
+        // can read, reachable by anyone who can hand the admin a .tar.gz. The
+        // restore applies the same rule to the same two names.
+        if !is_plain_file_name(&member.file) {
+            anyhow::bail!(
+                "the archive's manifest names {:?}, which is not a plain file name",
+                member.file
+            );
+        }
         let path = dir.join(&member.file);
         if !path.is_file() {
             anyhow::bail!("the archive promises {} but does not contain it", member.file);
@@ -542,7 +606,7 @@ pub async fn restore_backup(
     // is written. A damaged archive stops here, with the installation
     // untouched, instead of being discovered halfway through the restore.
     let mut report = RestoreReport::default();
-    match verify_unpacked(tmp.path())? {
+    let manifest = match verify_unpacked(tmp.path())? {
         Some(manifest) => {
             tracing::info!(
                 created = %manifest.created,
@@ -556,15 +620,73 @@ pub async fn restore_backup(
                      the documents will not come back, only the database"
                 );
             }
+            Some(manifest)
         }
-        None => tracing::warn!(
-            archive = archive_name,
-            "archive written before 0.1.27: it carries no manifest, so its contents cannot be \
-             verified before being restored"
-        ),
+        None => {
+            tracing::warn!(
+                archive = archive_name,
+                "archive written before 0.1.27: it carries no manifest, so its contents cannot be \
+                 verified before being restored"
+            );
+            None
+        }
+    };
+
+    // The member names come from the manifest, the same ones verify_unpacked
+    // just hashed. Reconstructing them from the current configuration instead -
+    // which is what this used to do - is how a restore ended up verifying one
+    // set of files and applying another: rename QDRANT__COLLECTION, or move
+    // the archive to another install, and the snapshot is verified under the
+    // name it was taken with but then looked for under the one configured now.
+    // It was not found, the run reported success, and only the database came
+    // back.
+    let sqlite_name = manifest
+        .as_ref()
+        .map(|m| m.sqlite.file.clone())
+        .unwrap_or_else(|| "rag_users.db".to_owned());
+    let snapshot_name = manifest
+        .as_ref()
+        .and_then(|m| m.qdrant.as_ref().map(|q| q.file.clone()))
+        .unwrap_or_else(|| format!("{qdrant_collection}.snapshot"));
+    // The names come out of the archive, so they are held to the rule an
+    // archive name from an HTTP body is: a plain file name. A manifest naming
+    // `../x` or an absolute path would otherwise point the restore at a file
+    // anywhere on the host, now that the restore applies what it names.
+    for name in [&sqlite_name, &snapshot_name] {
+        if !is_plain_file_name(name) {
+            anyhow::bail!("the archive's manifest names {name:?}, which is not a plain file name");
+        }
     }
 
-    let snapshot = tmp.path().join(format!("{qdrant_collection}.snapshot"));
+    // And an archive of a different collection is refused outright rather than
+    // applied to this one: uploading another collection's snapshot under this
+    // name would put vectors in the wrong place, which is worse than not
+    // restoring them. Nothing above this point has been written yet.
+    if let Some(taken_from) = manifest
+        .as_ref()
+        .and_then(|m| m.qdrant_collection.as_deref())
+    {
+        if taken_from != qdrant_collection {
+            anyhow::bail!(
+                "this archive holds the Qdrant collection {taken_from:?}, but this \
+                 installation is configured for {qdrant_collection:?}: restoring it would put \
+                 the vectors in the wrong collection. Nothing has been restored."
+            );
+        }
+    }
+
+    // The database is looked for before anything is written. A manifest always
+    // promises it, and verify_unpacked has made sure it is there, but an archive
+    // from before 0.1.27 carries no manifest: finding its database missing only
+    // after the snapshot upload would leave the vectors replaced and the
+    // database not, while reporting that nothing was restored. (It used to be
+    // reported as a success, with an empty report and nothing in the log.)
+    let sqlite = tmp.path().join(&sqlite_name);
+    if !sqlite.is_file() {
+        anyhow::bail!("the archive contains no {sqlite_name}: nothing was restored");
+    }
+
+    let snapshot = tmp.path().join(&snapshot_name);
     if snapshot.is_file() {
         upload_qdrant_snapshot(qdrant_url, qdrant_collection, &snapshot)
             .await
@@ -578,13 +700,10 @@ pub async fn restore_backup(
         );
     }
 
-    let sqlite = tmp.path().join("rag_users.db");
-    if sqlite.is_file() {
-        let (tables, rows) = restore_sqlite(db, &sqlite).await?;
-        tracing::info!(tables = tables.len(), rows, "SQLite restored");
-        report.sqlite_tables = tables;
-        report.sqlite_rows = rows;
-    }
+    let (tables, rows) = restore_sqlite(db, &sqlite).await?;
+    tracing::info!(tables = tables.len(), rows, "SQLite restored");
+    report.sqlite_tables = tables;
+    report.sqlite_rows = rows;
 
     Ok(report)
 }
@@ -595,9 +714,7 @@ pub async fn restore_backup(
 /// carrying a separator or a parent component could point the unpacker at an
 /// arbitrary file on the host.
 fn resolve_archive(backup_dir: &str, name: &str) -> Result<PathBuf> {
-    let is_plain_file_name =
-        Path::new(name).components().collect::<Vec<_>>().as_slice() == [Component::Normal(name.as_ref())];
-    if !is_plain_file_name {
+    if !is_plain_file_name(name) {
         anyhow::bail!("invalid archive name: {name:?}");
     }
     if !name.ends_with(".tar.gz") {
@@ -675,6 +792,25 @@ fn is_safe_entry_path(path: &Path) -> bool {
             .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
 }
 
+/// A name is a plain file name when joining it onto a directory can only ever
+/// produce a child of that directory: one `Normal` component, so no separator,
+/// no `..`, and nothing `join` would treat as absolute.
+///
+/// The same rule as `resolve_archive` applies to an archive name arriving in an
+/// HTTP body, and the same rule the restore applies to the member names a
+/// manifest carries. All three are strings from outside the program, and each
+/// is joined onto a directory this code then reads.
+///
+/// A backslash is refused outright: it is a separator on Windows and an
+/// ordinary character everywhere else, so allowing it would let the same name
+/// be a child on one platform and a path on another. None of the names this
+/// code produces contains one.
+fn is_plain_file_name(name: &str) -> bool {
+    !name.contains('\\')
+        && Path::new(name).components().collect::<Vec<_>>().as_slice()
+            == [Component::Normal(name.as_ref())]
+}
+
 async fn upload_qdrant_snapshot(qdrant_url: &str, collection: &str, snapshot: &Path) -> Result<()> {
     let bytes = std::fs::read(snapshot)
         .with_context(|| format!("reading snapshot {}", snapshot.display()))?;
@@ -723,19 +859,54 @@ async fn restore_sqlite(db: &SqlitePool, src: &Path) -> Result<(Vec<String>, u64
 
     let result = copy_tables(&mut conn).await;
 
+    // The three statements below put the connection back the way it was found.
+    // They were best-effort only while they succeed: if the ROLLBACK fails -
+    // the same SQLITE_BUSY or SQLITE_FULL that made the copy fail - the write
+    // transaction is still open, the DETACH cannot succeed while a transaction
+    // is open, and `PRAGMA foreign_keys = ON` is a silent no-op inside one.
+    // Handing that back would put a connection into the pool holding the
+    // RESERVED lock with foreign-key enforcement off, which is exactly what
+    // these lines exist to prevent, and every later user of that connection
+    // would inherit both with nothing to show why.
+    //
+    // So each step is checked, and a connection that could not be put back is
+    // closed rather than returned.
+    let mut dirty = false;
     if result.is_err() {
-        // Undo the half-written copy before handing the connection back:
-        // without this the pool inherits an open write transaction holding
-        // the RESERVED lock, and the next operation on that connection —
-        // including a retried restore, which cannot BEGIN inside it — fails
-        // with a confusing error far from the actual cause.
-        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+        // Undo the half-written copy before anything else: without this the
+        // next operation on that connection - including a retried restore,
+        // which cannot BEGIN inside an open transaction - fails with a
+        // confusing error far from the actual cause.
+        if let Err(e) = sqlx::query("ROLLBACK").execute(&mut *conn).await {
+            tracing::error!(
+                error = %e,
+                "the restore's ROLLBACK failed: the connection is being closed rather than \
+                 returned to the pool, since it still holds an open write transaction"
+            );
+            dirty = true;
+        }
     }
 
-    // Restore connection state whatever happened, so the connection is safe to
-    // hand back to the pool.
-    let _ = sqlx::query("DETACH DATABASE backup").execute(&mut *conn).await;
-    let _ = sqlx::query("PRAGMA foreign_keys = ON").execute(&mut *conn).await;
+    for statement in ["DETACH DATABASE backup", "PRAGMA foreign_keys = ON"] {
+        if let Err(e) = sqlx::query(statement).execute(&mut *conn).await {
+            tracing::error!(
+                statement,
+                error = %e,
+                "a restore connection could not be put back the way it was found"
+            );
+            dirty = true;
+        }
+    }
+    if dirty {
+        // The restore's own result is what the caller gets either way: a close
+        // that fails as well is worth the log line, not a different error.
+        if let Err(e) = conn.close().await {
+            tracing::error!(
+                error = %e,
+                "closing a restore connection that could not be reset failed as well"
+            );
+        }
+    }
 
     result
 }
@@ -1196,10 +1367,142 @@ mod tests {
         );
     }
 
+    /// A Qdrant that hands out a real, verifiable snapshot and records whether
+    /// it was asked to delete it afterwards.
+    async fn qdrant_serving_a_snapshot(
+        deleted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> (String, Vec<u8>) {
+        let bytes = b"not a real snapshot, but a real one to checksum".to_vec();
+        let sha = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(&bytes))
+        };
+        let size = bytes.len() as u64;
+        let meta = serde_json::json!({
+            "result": { "name": "backup.snapshot", "size": size, "checksum": sha }
+        });
+        let meta_body = meta.to_string();
+        let body = bytes.clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let serve = move |method: axum::http::Method| {
+                let deleted = deleted.clone();
+                let body = body.clone();
+                let meta_body = meta_body.clone();
+                async move {
+                    let payload = match method {
+                        axum::http::Method::POST => meta_body,
+                        axum::http::Method::DELETE => {
+                            deleted.store(true, std::sync::atomic::Ordering::SeqCst);
+                            String::new()
+                        }
+                        _ => String::from_utf8_lossy(&body).into_owned(),
+                    };
+                    (axum::http::StatusCode::OK, payload)
+                }
+            };
+            let _ = axum::serve(listener, axum::Router::new().fallback(serve)).await;
+        });
+        (format!("http://{addr}"), bytes)
+    }
+
+    /// Qdrant keeps a copy of every snapshot it creates, and nothing in this
+    /// project deleted it: `retain_last` prunes local tarballs only. So each
+    /// daily backup added a collection-sized snapshot to the Qdrant host,
+    /// growing without bound until that volume filled - and then the snapshot
+    /// POST started failing, which aborts the very backup meant to protect
+    /// against exactly this. The copy on the Qdrant host is dropped once ours
+    /// is verified.
+    #[tokio::test]
+    async fn the_snapshot_is_deleted_from_qdrant_once_ours_is_verified() {
+        let d = tempfile::tempdir().unwrap();
+        let deleted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (qdrant, bytes) = qdrant_serving_a_snapshot(deleted.clone()).await;
+        let dest = d.path().join("work");
+        std::fs::create_dir(&dest).unwrap();
+
+        let digest = create_qdrant_snapshot(&qdrant, "rag_documents", &dest)
+            .await
+            .expect("the snapshot we served verifies against its own checksum");
+        assert_eq!(digest.size, bytes.len() as u64);
+        assert!(
+            deleted.load(std::sync::atomic::Ordering::SeqCst),
+            "the snapshot Qdrant kept was never deleted, so every backup leaves another \
+             one on its host"
+        );
+    }
+
     // ── retention ───────────────────────────────────────────────────────────
+
+    /// A run must never hand back a path to a file that is already gone. The
+    /// write was outside the retention lock, so a competing run could list
+    /// and delete in the window between this run's pack and its own pass,
+    /// take the fresh archive with it, and leave this run returning `Ok` for a
+    /// path that no longer exists — the admin endpoint answering
+    /// `{"ok": true}` for a backup that was just deleted.
+    ///
+    /// The check is made inside each task, immediately after the call
+    /// returns: that is the moment the claim is made, and with the lock held a
+    /// second run cannot have reached its own pass yet. Asserting it after
+    /// joining both would be wrong — with `retain_last = 1` a *later* run
+    /// pruning the earlier archive is the policy working, not a fault.
+    ///
+    /// A handful of rounds, not a hundred: each one is two whole backups, and
+    /// the collision needs only a scheduler tick and a double-clicked button.
+    #[tokio::test]
+    async fn a_run_never_returns_a_path_already_deleted_by_a_competing_run() {
+        for round in 0..6 {
+            let d = tempfile::tempdir().unwrap();
+            let live = pool_at(&d.path().join("live.db")).await;
+            sqlx::query("CREATE TABLE users (id INTEGER PRIMARY KEY)")
+                .execute(&live)
+                .await
+                .unwrap();
+            let backup_dir = path_of(&d);
+            let (p1, p2) = (backup_dir.clone(), backup_dir.clone());
+            let (b1, b2) = (live.clone(), live.clone());
+
+            // retain_last = 1, so whichever run prunes second removes the
+            // other's archive - which is exactly the collision.
+            let run = |db: SqlitePool, dir: String| async move {
+                let archive =
+                    create_backup(&db, "", "http://127.0.0.1:9", "rag_documents", &dir, 1)
+                        .await
+                        .expect("the run itself must succeed");
+                (archive.display().to_string(), archive.is_file())
+            };
+            let a = tokio::spawn(run(b1, p1));
+            let b = tokio::spawn(run(b2, p2));
+            let (one, two) = tokio::join!(a, b);
+
+            for (path, there) in [one.unwrap(), two.unwrap()] {
+                assert!(
+                    there,
+                    "round {round}: a run returned {path}, which was already gone: a \
+                     competing run pruned it between the write and the retention pass"
+                );
+            }
+            // And the policy itself still holds: two runs, one kept.
+            assert_eq!(
+                list_backups(&backup_dir).await.len(),
+                1,
+                "round {round}: retain_last = 1 over two runs must leave one archive"
+            );
+        }
+    }
 
     fn fake_archive(dir: &Path, name: &str) {
         std::fs::write(dir.join(name), b"not really an archive").unwrap();
+    }
+
+    /// One retention pass, taken the way `create_backup` takes it: the lock
+    /// first, then the pass. A test that called the pass without the lock
+    /// would not be exercising the ordering the real run has.
+    async fn prune(dir: &str, retain_last: u64, just_written: &str) {
+        let held = PRUNE_LOCK.lock().await;
+        prune_old_backups(dir, retain_last, just_written, &held).await;
     }
 
     fn path_of(dir: &tempfile::TempDir) -> String {
@@ -1212,7 +1515,7 @@ mod tests {
         for n in 1..=3 {
             fake_archive(dir.path(), &format!("backup_2026010{n}_000000_aaa{n}1111.tar.gz"));
         }
-        prune_old_backups(dir.path().to_str().unwrap(), 0, "").await;
+        prune(dir.path().to_str().unwrap(), 0, "").await;
         assert_eq!(list_backups(dir.path().to_str().unwrap()).await.len(), 3);
     }
 
@@ -1223,7 +1526,7 @@ mod tests {
             fake_archive(dir.path(), &format!("backup_2026010{n}_000000_aaa{n}1111.tar.gz"));
         }
         fake_archive(dir.path(), "someone-elses-archive.tar.gz");
-        prune_old_backups(
+        prune(
             dir.path().to_str().unwrap(),
             2,
             "backup_20260104_000000_aaa41111.tar.gz",
@@ -1271,7 +1574,7 @@ mod tests {
         fake_archive(dir.path(), older);
         fake_archive(dir.path(), just_written);
 
-        prune_old_backups(dir.path().to_str().unwrap(), 1, just_written).await;
+        prune(dir.path().to_str().unwrap(), 1, just_written).await;
 
         assert_eq!(
             list_backups(dir.path().to_str().unwrap()).await,
@@ -1295,8 +1598,8 @@ mod tests {
             fake_archive(dir.path(), two);
 
             let (p1, p2) = (path_of(&dir), path_of(&dir));
-            let a = tokio::spawn(async move { prune_old_backups(&p1, 1, one).await });
-            let b = tokio::spawn(async move { prune_old_backups(&p2, 1, two).await });
+            let a = tokio::spawn(async move { prune(&p1, 1, one).await });
+            let b = tokio::spawn(async move { prune(&p2, 1, two).await });
             let _ = tokio::join!(a, b);
 
             assert_eq!(
@@ -1423,6 +1726,353 @@ mod tests {
             .filename(path)
             .create_if_missing(true);
         SqlitePool::connect_with(opts).await.unwrap()
+    }
+
+    /// An archive whose manifest says exactly this: a sound copy of `live` at
+    /// `sqlite_name`, an optional snapshot at `snapshot_name`, and the
+    /// collection it was taken from. Built by hand rather than through
+    /// `create_backup` so a restore can be pointed at a configuration the
+    /// archive was not taken under.
+    async fn archive_with_manifest(
+        live: &SqlitePool,
+        backup_dir: &Path,
+        sqlite_name: &str,
+        snapshot_name: Option<&str>,
+        collection: Option<&str>,
+    ) -> String {
+        let work = backup_dir.join("work");
+        std::fs::create_dir(&work).unwrap();
+        // VACUUM INTO a fixed name and then rename: the manifest may claim a
+        // different one, and the point is that the manifest decides.
+        let real = work.join("real.db");
+        sqlx::query(&format!("VACUUM INTO '{}'", real.display()))
+            .execute(live)
+            .await
+            .unwrap();
+        let digest = digest_of(&real).unwrap();
+        std::fs::rename(&real, work.join(sqlite_name)).unwrap();
+        let sqlite = MemberDigest {
+            file: sqlite_name.to_owned(),
+            ..digest
+        };
+
+        let qdrant = snapshot_name.map(|name| {
+            std::fs::write(work.join(name), b"not a real snapshot").unwrap();
+            let digest = digest_of(&work.join(name)).unwrap();
+            MemberDigest {
+                file: name.to_owned(),
+                ..digest
+            }
+        });
+
+        let manifest = BackupManifest {
+            format: MANIFEST_FORMAT,
+            created: Utc::now().to_rfc3339(),
+            engine_version: "test".to_owned(),
+            sqlite,
+            qdrant,
+            qdrant_collection: collection.map(str::to_owned),
+        };
+        std::fs::write(
+            work.join(MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let archive = backup_dir.join("archive.tar.gz");
+        pack_tar_gz(&work, &archive).unwrap();
+        archive.file_name().unwrap().to_str().unwrap().to_owned()
+    }
+
+    /// The manifest names the collection the snapshot was taken from, and a
+    /// restore into a differently-configured one used to verify the archive
+    /// and then quietly restore half of it: the snapshot was hashed under the
+    /// name it was written with, and then looked for under the name this
+    /// installation is configured for. Not found, warning logged, the run
+    /// reported success, and only the database came back. An archive of
+    /// another collection is refused instead, before anything is written.
+    #[tokio::test]
+    async fn an_archive_of_another_collection_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let live = pool_at(&d.path().join("live.db")).await;
+        sqlx::query("CREATE TABLE documents (id INTEGER PRIMARY KEY)")
+            .execute(&live)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO documents (id) VALUES (1)")
+            .execute(&live)
+            .await
+            .unwrap();
+        let backup_dir = d.path().join("backups");
+        std::fs::create_dir(&backup_dir).unwrap();
+        let archive = archive_with_manifest(
+            &live,
+            &backup_dir,
+            "rag_users.db",
+            Some("rag_documents.snapshot"),
+            Some("rag_documents"),
+        )
+        .await;
+
+        // This installation points at a different collection now.
+        let err = restore_backup(
+            &live,
+            "http://127.0.0.1:9",
+            "rag_docs_v2",
+            backup_dir.to_str().unwrap(),
+            &archive,
+        )
+        .await
+        .expect_err("an archive of another collection must not be applied to this one");
+        let reported = format!("{err:#}");
+        assert!(reported.contains("rag_documents"), "{reported}");
+        assert!(reported.contains("rag_docs_v2"), "{reported}");
+
+        // And nothing was restored: the live row is still the only one.
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM documents")
+            .fetch_one(&live)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "a refused restore must not touch the database");
+    }
+
+    /// The same archive under its own collection name is applied, so the check
+    /// above is not simply refusing every archive with a snapshot in it.
+    #[tokio::test]
+    async fn an_archive_of_this_collection_is_applied() {
+        let d = tempfile::tempdir().unwrap();
+        let live = pool_at(&d.path().join("live.db")).await;
+        sqlx::query("CREATE TABLE documents (id INTEGER PRIMARY KEY)")
+            .execute(&live)
+            .await
+            .unwrap();
+        let backup_dir = d.path().join("backups");
+        std::fs::create_dir(&backup_dir).unwrap();
+        let archive = archive_with_manifest(
+            &live,
+            &backup_dir,
+            "rag_users.db",
+            Some("rag_documents.snapshot"),
+            Some("rag_documents"),
+        )
+        .await;
+
+        // No Qdrant: the upload fails, which is enough to show the check let
+        // the restore through to the point of trying.
+        let err = restore_backup(
+            &live,
+            "http://127.0.0.1:9",
+            "rag_documents",
+            backup_dir.to_str().unwrap(),
+            &archive,
+        )
+        .await
+        .expect_err("nothing listens on port 9, so the upload cannot succeed");
+        assert!(
+            !format!("{err:#}").contains("wrong collection"),
+            "a matching collection must not be refused: {err:#}"
+        );
+    }
+
+    /// The manifest is also what says where the database is. Reconstructing the
+    /// name from the current configuration meant a manifest-less or renamed
+    /// member was verified under one name and then applied as though it were
+    /// not there at all - and, because the branch had no `else`, that was
+    /// reported as a successful restore of nothing.
+    #[tokio::test]
+    async fn the_manifest_decides_where_the_database_is_looked_for() {
+        let d = tempfile::tempdir().unwrap();
+        let live = pool_at(&d.path().join("live.db")).await;
+        sqlx::query("CREATE TABLE documents (id INTEGER PRIMARY KEY)")
+            .execute(&live)
+            .await
+            .unwrap();
+        let backup_dir = d.path().join("backups");
+        std::fs::create_dir(&backup_dir).unwrap();
+        // A member name nothing but the manifest knows.
+        let archive = archive_with_manifest(&live, &backup_dir, "accounts.db", None, None).await;
+
+        let report = restore_backup(
+            &live,
+            "http://127.0.0.1:9",
+            "rag_documents",
+            backup_dir.to_str().unwrap(),
+            &archive,
+        )
+        .await
+        .expect("a manifest that names the member is the authority on where it is");
+        assert!(report.verified);
+        assert_eq!(
+            report.sqlite_tables,
+            vec!["documents".to_string()],
+            "the database the manifest names must be the one restored"
+        );
+    }
+
+    /// An archive with no database in it is not a restore: it used to be
+    /// reported as a success, with an empty report and nothing in the log. And
+    /// it is refused before the snapshot upload - an archive from before 0.1.27
+    /// has no manifest to promise the database, and discovering it missing only
+    /// after the vectors were replaced would leave half a restore behind.
+    #[tokio::test]
+    async fn an_archive_with_no_database_is_an_error_not_a_successful_restore() {
+        let d = tempfile::tempdir().unwrap();
+        let live = pool_at(&d.path().join("live.db")).await;
+        let backup_dir = d.path().join("backups");
+        let work = backup_dir.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        // No manifest, as before 0.1.27, and a snapshot but no database.
+        std::fs::write(work.join("rag_documents.snapshot"), b"not a real snapshot").unwrap();
+        pack_tar_gz(&work, &backup_dir.join("legacy.tar.gz")).unwrap();
+
+        let err = restore_backup(
+            &live,
+            "http://127.0.0.1:9",
+            "rag_documents",
+            backup_dir.to_str().unwrap(),
+            "legacy.tar.gz",
+        )
+        .await
+        .expect_err("an archive without a database is not restorable");
+        // Refused for the database, not failed at the upload: nothing listens
+        // on port 9, so reaching the upload would have failed there instead.
+        assert!(format!("{err:#}").contains("rag_users.db"), "{err:#}");
+    }
+
+    /// The manifest is read out of the archive, so the names in it are held to
+    /// the rule an archive name from an HTTP body is: a plain file name. One
+    /// naming an absolute path - here another database on the host, with its
+    /// correct digest, so verification alone lets it through - is refused
+    /// before anything is applied.
+    #[tokio::test]
+    async fn a_manifest_naming_a_file_outside_the_archive_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let live = pool_at(&d.path().join("live.db")).await;
+        sqlx::query("CREATE TABLE documents (id INTEGER PRIMARY KEY)")
+            .execute(&live)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO documents (id) VALUES (1)")
+            .execute(&live)
+            .await
+            .unwrap();
+        // Another database on the same host.
+        let elsewhere = d.path().join("elsewhere.db");
+        let other = pool_at(&elsewhere).await;
+        sqlx::query("CREATE TABLE documents (id INTEGER PRIMARY KEY)")
+            .execute(&other)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO documents (id) VALUES (42)")
+            .execute(&other)
+            .await
+            .unwrap();
+        other.close().await;
+
+        let backup_dir = d.path().join("backups");
+        let work = backup_dir.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let manifest = BackupManifest {
+            format: MANIFEST_FORMAT,
+            created: Utc::now().to_rfc3339(),
+            engine_version: "test".to_owned(),
+            sqlite: MemberDigest {
+                file: elsewhere.to_str().unwrap().to_owned(),
+                ..digest_of(&elsewhere).unwrap()
+            },
+            qdrant: None,
+            qdrant_collection: None,
+        };
+        std::fs::write(work.join(MANIFEST_FILE), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        pack_tar_gz(&work, &backup_dir.join("outside.tar.gz")).unwrap();
+
+        let err = restore_backup(
+            &live,
+            "http://127.0.0.1:9",
+            "rag_documents",
+            backup_dir.to_str().unwrap(),
+            "outside.tar.gz",
+        )
+        .await
+        .expect_err("a manifest naming a file outside the archive must be refused");
+        assert!(format!("{err:#}").contains("not a plain file name"), "{err:#}");
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM documents")
+            .fetch_all(&live)
+            .await
+            .unwrap();
+        assert_eq!(ids, [1], "nothing from the other database may reach the live one");
+    }
+
+    /// The other half of the same rule, on the side that runs first. The
+    /// restore refuses a name that is not a plain file name, but only after
+    /// `verify_unpacked` has already resolved and **hashed** it — and an
+    /// absolute path makes `join` throw the base away. The digest of whatever
+    /// that pointed at is then reported in the mismatch message, so a
+    /// hand-delivered archive could be used to read the size and sha256 of any
+    /// file this process can open.
+    ///
+    /// So the name is checked where it is first consumed. Asserted on the
+    /// digest *not* appearing, which is the part that was leaking.
+    #[tokio::test]
+    async fn verification_does_not_read_a_file_the_manifest_points_outside_at() {
+        let d = tempfile::tempdir().unwrap();
+        let secret = d.path().join("host-file.db");
+        std::fs::write(&secret, b"a secret the archive has no business hashing").unwrap();
+        let secret_digest = digest_of(&secret).unwrap();
+
+        // An unpacked archive whose manifest promises that absolute path, with
+        // its digest supplied correctly so the mismatch branch is the one
+        // reached.
+        let dir = d.path().join("unpacked");
+        std::fs::create_dir(&dir).unwrap();
+        let manifest = BackupManifest {
+            format: MANIFEST_FORMAT,
+            created: Utc::now().to_rfc3339(),
+            engine_version: "test".to_owned(),
+            sqlite: MemberDigest {
+                file: secret.to_str().unwrap().to_owned(),
+                ..secret_digest.clone()
+            },
+            qdrant: None,
+            qdrant_collection: None,
+        };
+        std::fs::write(
+            dir.join(MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let err = verify_unpacked(&dir)
+            .expect_err("a manifest naming a file outside the archive must be refused");
+        let reported = format!("{err:#}");
+        assert!(
+            reported.contains("not a plain file name"),
+            "the name must be refused as such: {reported}"
+        );
+        assert!(
+            !reported.contains(&secret_digest.sha256),
+            "the digest of a file outside the archive leaked into the report: {reported}"
+        );
+    }
+
+    /// The rule itself, so it is stated once and tested once.
+    #[test]
+    fn a_plain_file_name_has_no_separator_no_parent_and_is_not_absolute() {
+        for plain in ["backup.tar.gz", "rag_users.db", "a", "x.tar.gz"] {
+            assert!(is_plain_file_name(plain), "{plain:?}");
+        }
+        for hostile in [
+            "",
+            ".",
+            "..",
+            "../x",
+            "a/b",
+            "a\\b",
+            "/etc/passwd",
+            "./x",
+            "C:\\x",
+        ] {
+            assert!(!is_plain_file_name(hostile), "{hostile:?}");
+        }
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@
 //! DELETE /api/admin/qdrant/document/{id}   → delete all vectors for a document
 //! GET    /api/admin/sqlite/documents        → all rows (soft-deleted included)
 
+use anyhow::Context;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -125,30 +126,91 @@ pub async fn restore_backup(
     .await
     {
         Ok(report) => Json(json!({ "ok": true, "restored": report })).into_response(),
-        // A bad archive name is the caller's mistake, not a server fault; every
-        // other failure happened while restoring and is ours.
+        // A bad archive - the name, or the archive itself - is the caller's
+        // mistake, not a server fault. Every other failure happened while
+        // restoring and is ours.
         Err(e) if is_bad_request(&e) => err(StatusCode::BAD_REQUEST, e),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
 }
 
+/// Whether the restore failed because of the archive or the name it was given,
+/// rather than because of us.
+///
+/// The archive's own failures are the caller's to fix - wrong name, damaged or
+/// truncated tarball, a digest that does not match, a member missing, a
+/// manifest naming something outside the archive, a snapshot belonging to a
+/// collection this installation is not configured for. Reporting those as 5xx
+/// was not merely a wrong status: `err` deliberately withholds a 5xx's message
+/// from the caller, so an admin who picked the wrong archive, or restored one
+/// taken from another collection, was told "internal server error" and nothing
+/// about which archive or why.
+///
+/// Matched against the whole chain, not `e.to_string()`: that is only the
+/// outermost context, so any `.context()` added above one of these in the
+/// service would silently demote a 4xx to a 5xx with the message hidden. The
+/// test below holds every refusal the service can produce here, so a new one
+/// has to be classified deliberately rather than by omission.
 fn is_bad_request(e: &anyhow::Error) -> bool {
-    let msg = e.to_string();
-    msg.starts_with("invalid archive name")
-        || msg.starts_with("not a backup archive")
-        || msg.starts_with("archive not found")
+    let msg = format!("{e:#}");
+    const CALLER_FAULT: &[&str] = &[
+        // resolve_archive
+        "invalid archive name",
+        "not a backup archive",
+        "archive not found",
+        // unpack_tar_gz
+        "archive entry escapes the destination",
+        "archive entry is not a regular file or directory",
+        "the archive's gzip stream",
+        // verify_unpacked
+        "parsing backup.json",
+        "this archive is in backup format",
+        "not a plain file name",
+        "the archive promises",
+        "does not match the archive's own manifest",
+        // restore_backup
+        "the archive contains no",
+        "holds the Qdrant collection",
+    ];
+    CALLER_FAULT.iter().any(|reason| msg.contains(reason))
 }
 
 // ── GET /api/admin/qdrant/stats ───────────────────────────────────────────────
+
+/// What to do with a Qdrant collection-info reply.
+///
+/// Split out from the handler so the rule is testable without a Qdrant: a
+/// non-success status is a 502 carrying the status and the body, and only a
+/// success is handed to the browser as the collection's state.
+fn collection_info_response(status: reqwest::StatusCode, body: String) -> Response {
+    if status.is_success() {
+        return match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(value) => Json(value).into_response(),
+            Err(e) => err(StatusCode::BAD_GATEWAY, e),
+        };
+    }
+    err(
+        StatusCode::BAD_GATEWAY,
+        format!("Qdrant refused the collection info ({status}): {body}"),
+    )
+}
 
 pub async fn qdrant_stats(State(state): State<AppState>, claims: Claims) -> Response {
     if let Some(r) = require_admin(&claims) { return r; }
     let url = format!("{}/collections/{}", state.settings.qdrant.url, state.settings.qdrant.collection);
     match reqwest::get(&url).await {
-        Ok(r) => match r.json::<serde_json::Value>().await {
-            Ok(body) => Json(body).into_response(),
-            Err(e) => err(StatusCode::BAD_GATEWAY, e),
-        },
+        // The status is checked before the body is passed on. This handler is
+        // the one place a Qdrant reply reaches the browser verbatim, so a 404
+        // ("Not found: collection …") or a 401 was rendered by the admin panel
+        // as if it were the collection's real state: an error object where the
+        // tab expects result.points_count, which reads as "0 points" for a
+        // collection that is full. The rest of this file reports the status and
+        // the body; this now does too.
+        Ok(r) => {
+            let status = r.status();
+            let body = r.text().await.unwrap_or_default();
+            collection_info_response(status, body)
+        }
         Err(e) => err(StatusCode::BAD_GATEWAY, e),
     }
 }
@@ -157,29 +219,94 @@ pub async fn qdrant_stats(State(state): State<AppState>, claims: Claims) -> Resp
 
 pub async fn qdrant_documents(State(state): State<AppState>, claims: Claims) -> Response {
     if let Some(r) = require_admin(&claims) { return r; }
-    let url = format!(
-        "{}/collections/{}/points/scroll",
-        state.settings.qdrant.url, state.settings.qdrant.collection
-    );
-    let body = json!({ "limit": 10000, "with_payload": true, "with_vector": false });
     let client = reqwest::Client::new();
-    let resp = match client.post(&url).json(&body).send().await {
-        Ok(r) => r,
-        Err(e) => return err(StatusCode::BAD_GATEWAY, e),
-    };
-    let raw: serde_json::Value = match resp.json().await {
-        Ok(v) => v,
-        Err(e) => return err(StatusCode::BAD_GATEWAY, e),
-    };
+    match scroll_all_documents(&client, &state.settings.qdrant.url, &state.settings.qdrant.collection).await {
+        Ok(list) => Json(json!({ "documents": list })).into_response(),
+        Err(e) => err(StatusCode::BAD_GATEWAY, e),
+    }
+}
 
-    // Group by document_id from the payloads.
-    let mut docs: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
-    if let Some(points) = raw.get("result").and_then(|r| r.get("points")).and_then(|p| p.as_array()) {
-        for point in points {
-            if let Some(payload) = point.get("payload") {
-                let doc_id = payload.get("document_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+/// How many points one scroll request asks for.
+const SCROLL_PAGE: usize = 1000;
+
+/// Ceiling on the pages one call will fetch, so a misbehaving or hostile
+/// endpoint that always reports another page cannot spin here forever.
+const SCROLL_MAX_PAGES: usize = 1000;
+
+/// Every document in the collection, with the number of chunks each has.
+///
+/// The scroll is followed to the end. Asking once with a limit and taking what
+/// comes back is the shape this used to have, and it silently truncates: the
+/// limit is in **points**, and a document is a few dozen of those, so a
+/// collection of any size stopped at the first page and the admin's sync check
+/// then reported every document past it as "in SQLite but not in Qdrant" -
+/// documents that are entirely present and entirely fine, listed for deletion.
+async fn scroll_all_documents(
+    client: &reqwest::Client,
+    qdrant_url: &str,
+    collection: &str,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let url = format!("{qdrant_url}/collections/{collection}/points/scroll");
+    let mut docs: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+    // A point id. This project's are UUID strings, and the scroll offset is
+    // whatever the previous page's next_page_offset was, so it is passed back
+    // exactly as Qdrant gave it rather than read as a number.
+    let mut offset: Option<serde_json::Value> = None;
+
+    for _ in 0..SCROLL_MAX_PAGES {
+        let mut body = json!({
+            "limit": SCROLL_PAGE,
+            "with_payload": true,
+            "with_vector": false,
+        });
+        if let Some(at) = &offset {
+            body["offset"] = at.clone();
+        }
+        let resp = client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("scrolling the vectors of {collection}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let detail = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Qdrant refused the scroll of {collection} ({status}): {detail}");
+        }
+        let raw: serde_json::Value = resp
+            .json()
+            .await
+            .with_context(|| format!("reading the scroll of {collection}"))?;
+
+        // A page short of the limit is the last one. Qdrant also hands back
+        // `next_page_offset`, and that is the authoritative answer, so it is
+        // preferred and the length is only the fallback for an older build that
+        // omits it.
+        let result = raw.get("result");
+        let points = result
+            .and_then(|r| r.get("points"))
+            .and_then(|p| p.as_array())
+            .map(Vec::len)
+            .unwrap_or(0);
+        let next = result
+            .and_then(|r| r.get("next_page_offset"))
+            .filter(|v| !v.is_null())
+            .cloned();
+        let last = next.is_none() && points < SCROLL_PAGE;
+
+        // Group by document_id from the payloads.
+        if let Some(points) = result
+            .and_then(|r| r.get("points"))
+            .and_then(|p| p.as_array())
+        {
+            for point in points {
+                let Some(payload) = point.get("payload") else {
+                    continue;
+                };
+                let doc_id = payload.get("document_id").and_then(|v| v.as_str()).unwrap_or("");
                 if doc_id.is_empty() { continue; }
-                let entry = docs.entry(doc_id.clone()).or_insert_with(|| json!({
+                let entry = docs.entry(doc_id.to_owned()).or_insert_with(|| json!({
                     "document_id": doc_id,
                     "filename": payload.get("filename").and_then(|v| v.as_str()).unwrap_or(""),
                     "upload_date": payload.get("upload_date").and_then(|v| v.as_str()).unwrap_or(""),
@@ -190,14 +317,20 @@ pub async fn qdrant_documents(State(state): State<AppState>, claims: Claims) -> 
                 }
             }
         }
+
+        match next {
+            Some(at) if !last => offset = Some(at),
+            _ => break,
+        }
     }
+
     let mut list: Vec<serde_json::Value> = docs.into_values().collect();
     list.sort_by(|a, b| {
         let da = a.get("upload_date").and_then(|v| v.as_str()).unwrap_or("");
         let db = b.get("upload_date").and_then(|v| v.as_str()).unwrap_or("");
         db.cmp(da)
     });
-    Json(json!({ "documents": list })).into_response()
+    Ok(list)
 }
 
 // ── DELETE /api/admin/qdrant/document/{id} ────────────────────────────────────
@@ -232,34 +365,190 @@ pub async fn sqlite_documents(State(state): State<AppState>, claims: Claims) -> 
 
 #[cfg(test)]
 mod tests {
+    use super::collection_info_response;
     use super::is_bad_request;
+    use super::scroll_all_documents;
+
+    /// The admin panel's sync check asks Qdrant which documents exist and
+    /// reports any that SQLite has and Qdrant does not. That answer came from
+    /// a single scroll with a fixed limit, so on any collection past it the
+    /// check listed perfectly healthy documents as missing - and the panel
+    /// offers to delete them.
+    ///
+    /// The pages are followed here: the fake answers with one page, then a
+    /// second, then stops.
+    #[tokio::test]
+    async fn the_scroll_is_followed_until_qdrant_says_there_is_no_more() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let read = stream.read(&mut buf).await.unwrap_or(0);
+                    // Which page is being asked for is decided by the request
+                    // body carrying an offset.
+                    let asked_for_second = read > 0
+                        && String::from_utf8_lossy(&buf[..read]).contains("\"offset\"");
+                    let page: serde_json::Value = if asked_for_second {
+                        serde_json::json!({
+                            "result": {
+                                "points": [
+                                    { "payload": { "document_id": "doc-b", "filename": "b.pdf",
+                                                   "upload_date": "2026-01-02T00:00:00Z" } },
+                                    { "payload": { "document_id": "doc-c", "filename": "c.pdf",
+                                                   "upload_date": "2026-01-03T00:00:00Z" } },
+                                ],
+                                "next_page_offset": null,
+                            }
+                        })
+                    } else {
+                        serde_json::json!({
+                            "result": {
+                                "points": [
+                                    { "payload": { "document_id": "doc-a", "filename": "a.pdf",
+                                                   "upload_date": "2026-01-01T00:00:00Z" } },
+                                    { "payload": { "document_id": "doc-b", "filename": "b.pdf",
+                                                   "upload_date": "2026-01-02T00:00:00Z" } },
+                                ],
+                                // Point ids here are UUIDs, so the offset is a
+                                // string, as Qdrant returns it for them.
+                                "next_page_offset": "3f2b8c1e-7d4a-4e9b-9a6f-2c1d0e5b7a91",
+                            }
+                        })
+                    };
+                    let body = page.to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        let list = scroll_all_documents(
+            &reqwest::Client::new(),
+            &format!("http://{addr}"),
+            "rag_documents",
+        )
+        .await
+        .expect("both pages");
+        let ids: Vec<&str> = list
+            .iter()
+            .map(|d| d["document_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            ["doc-c", "doc-b", "doc-a"],
+            "newest first, and doc-c is only on the second page"
+        );
+        let chunks = |id: &str| {
+            list.iter()
+                .find(|d| d["document_id"] == id)
+                .unwrap()["chunk_count"]
+                .as_i64()
+                .unwrap()
+        };
+        assert_eq!(chunks("doc-b"), 2, "a document spanning two pages is counted once per chunk");
+    }
+
+    /// Qdrant's error objects are valid JSON, so parsing one used to succeed and
+    /// the panel was handed `{"status": {"error": "Not found: collection …"}}`
+    /// where it looks for `result.points_count` — which reads as "0 points" and
+    /// "0 vectors". A full collection, a wrong api-key and a typo in
+    /// QDRANT__COLLECTION all looked like an empty one.
+    ///
+    /// The distinction that matters is 200 against not-200: a refusal must not
+    /// be rendered as the collection's state. The status and body go to the log
+    /// rather than to the caller, which is this codebase's standing rule for
+    /// 5xx — the point is that the panel shows a failure, not a plausible lie.
+    #[tokio::test]
+    async fn a_refused_collection_info_is_never_passed_through_as_state() {
+        let error_body =
+            r#"{"status":{"error":"Not found: collection `rag_documents` doesn't exist!","status":"error"}}"#
+                .to_owned();
+        let refused = collection_info_response(reqwest::StatusCode::NOT_FOUND, error_body);
+        assert_eq!(refused.status(), axum::http::StatusCode::BAD_GATEWAY);
+        let text = axum::body::to_bytes(refused.into_body(), 64 * 1024).await.unwrap();
+        let reported = String::from_utf8_lossy(&text);
+        assert!(
+            !reported.contains("doesn't exist"),
+            "Qdrant's error object must not reach the browser as if it were state: {reported}"
+        );
+
+        // And a real reply, with the same shape Qdrant really returns, still
+        // goes through untouched.
+        let ok = r#"{"result":{"status":"green","points_count":42,"vectors_count":42}}"#;
+        let passed = collection_info_response(reqwest::StatusCode::OK, ok.to_owned());
+        assert_eq!(passed.status(), axum::http::StatusCode::OK);
+        let text = axum::body::to_bytes(passed.into_body(), 64 * 1024).await.unwrap();
+        assert!(String::from_utf8_lossy(&text).contains("\"points_count\":42"));
+    }
+
+    /// A 200 that is not the expected shape is an error, not a blank tab that
+    /// reads as "no vectors".
+    #[tokio::test]
+    async fn a_successful_but_unparsable_reply_is_a_502() {
+        let response = collection_info_response(reqwest::StatusCode::OK, "not json".to_owned());
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+    }
 
     fn bad(msg: &str) -> anyhow::Error {
         anyhow::anyhow!("{msg}")
     }
 
-    /// The three prefix strings must stay in sync with
-    /// backup::service::resolve_archive: a drift here misclassifies a
-    /// caller error as a 500.
+    /// Every refusal backup::service can produce about the archive or the name
+    /// it was given, held here so a drift misclassifying a caller error as a
+    /// 500 shows up as a failing test rather than as an admin told
+    /// "internal server error".
     #[test]
     fn caller_errors_are_recognised() {
         for msg in [
+            // resolve_archive
             "invalid archive name: \"../x.tar.gz\"",
             "not a backup archive: \"rag_users.db\"",
             "archive not found: absent.tar.gz",
+            // unpack_tar_gz
+            "archive entry escapes the destination: x",
+            "archive entry is not a regular file or directory: link",
+            "the archive's gzip stream is truncated or its checksum does not match",
+            // verify_unpacked
+            "parsing backup.json: expected value at line 1 column 1",
+            "this archive is in backup format 9 and was written by a newer engine (x)",
+            "the archive's manifest names \"/etc/passwd\", which is not a plain file name",
+            "the archive promises rag_users.db but does not contain it",
+            "rag_users.db does not match the archive's own manifest - the backup is damaged",
+            // restore_backup
+            "the archive contains no rag_users.db: nothing was restored",
+            "this archive holds the Qdrant collection \"old\", but this installation is \
+             configured for \"new\"",
         ] {
             assert!(is_bad_request(&bad(msg)), "msg={msg:?}");
         }
     }
 
+    /// And ours, which must keep their 5xx - and with it the withheld message.
     #[test]
     fn server_faults_are_not_recognised() {
         for msg in [
-            "archive entry escapes the destination: x",
             "the Qdrant snapshot could not be verified, backup aborted",
+            "the Qdrant snapshot is corrupt: expected sha256 aa, got bb",
             "internal server error",
+            "",
         ] {
             assert!(!is_bad_request(&bad(msg)), "msg={msg:?}");
         }
+    }
+
+    /// The classification reads the whole chain, so a `.context()` added above
+    /// one of these in the service cannot quietly demote a 4xx into a 5xx with
+    /// the message withheld.
+    #[test]
+    fn a_wrapped_caller_error_is_still_a_caller_error() {
+        let wrapped = bad("invalid archive name: \"x\"").context("restoring backup");
+        assert!(is_bad_request(&wrapped), "{wrapped:#}");
     }
 }
