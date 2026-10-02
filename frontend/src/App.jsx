@@ -470,8 +470,22 @@ function App() {
     }
   }
 
+  // Cuts on a character boundary, not a UTF-16 code unit. `substring(0, 50)`
+  // counts code units, so a title containing an emoji — two units, one
+  // character — was cut in half at position 49 or 50 and the stored title
+  // carried a lone surrogate, which every renderer draws as U+FFFD. Asking a
+  // question in any script with astral characters (emoji, rarer CJK, some
+  // Indic conjuncts) was enough, and it is the question most likely to be long.
+  const TITLE_CHARS = 50
+  const cutTitle = (text) => {
+    const chars = Array.from(text)       // by code point, so never half a character
+    if (chars.length <= TITLE_CHARS) return text
+    return chars.slice(0, TITLE_CHARS).join('').trimEnd() + '...'
+  }
+
   const updateConversationTitleApi = async (convId, firstMessage) => {
-    const title = firstMessage.substring(0, 50) + (firstMessage.length > 50 ? '...' : '')
+    const title = cutTitle(firstMessage)
+    if (!title.trim()) return   // backend rejects an all-blank title
     try {
       await axios.put(`${API_URL}/api/conversations/${convId}`, { title })
       setConversations(prev => prev.map(c => c.id === convId ? { ...c, title } : c))
