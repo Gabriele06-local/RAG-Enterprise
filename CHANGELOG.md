@@ -22,6 +22,292 @@ separate files is what stops two pull requests colliding in this one.
 
 ---
 
+## [0.1.47] - 2026-10-02
+
+### Added
+
+- **The vectors can take 8 or 16 times less RAM: `QDRANT__QUANTIZATION`.**
+  With `turbo4`, Qdrant keeps a TurboQuant copy of every vector in RAM —
+  520 bytes instead of 4 KiB at 1024 dimensions — and moves the originals to
+  disk. Each search picks its candidates on the compressed copies and
+  re-scores twice as many as it returns on the originals; `turbo2` halves
+  the RAM again and re-scores four times as many. The results are nearly
+  always those of a full-precision search, not always: a chunk the
+  compression ranks below that shortlist is never re-scored, so it is
+  missed — most likely one nearly tied with others near the bottom of the
+  list. On a synthetic test of 30,000 vectors, `turbo4` kept all of the top
+  15 results and `turbo2` 99% of them; try it with `--bench` on your own
+  documents before relying on it. `off`, the default, keeps every vector in
+  RAM as before. The setting is applied to the existing collection at
+  startup, and undone the same way; Qdrant re-encodes the vectors in the
+  background while searches go on. Needs Qdrant 1.18 or later, which is
+  what the bundle ships.
+
+### Changed
+
+- **Searches go through Qdrant's Query API.** The Search API they used is
+  deprecated, and Qdrant's 1.19 release notes announce its removal — 1.19.1
+  still answers it, but the next update may not. Same results, nothing to
+  do on upgrade; checked against the bundled Qdrant 1.18.2 and against
+  1.19.1.
+
+- **`spin` 0.9.9 replaces 0.9.8, which is yanked.** Its author yanked
+  every earlier 0.9 release when 0.9.9 came out in July, without saying
+  why, and no advisory names it. It reaches this server through axum's
+  multipart parser and sqlx's SQLite driver. A patch bump in
+  `Cargo.lock`; no code changed.
+
+### Fixed
+
+- **A bad backup archive is now reported as a bad request, with its
+  reason.** Picking the wrong archive, restoring one whose digest does not
+  match, one missing a member, or one taken from a collection this
+  installation is not configured for, was answered `500` — and a 5xx's message
+  is deliberately withheld, so the admin was told "internal server error" and
+  nothing about which archive or why. The classification now also reads the
+  whole error chain, so a `.context()` added in the service cannot quietly
+  demote a 4xx into a 5xx, and a test holds every refusal the service can
+  produce so a new one has to be classified deliberately.
+
+- **The admin panel's vector listing no longer stops at the first page.**
+  It asked Qdrant once for a fixed 10,000 points, but the limit counts chunks,
+  not documents, and a document is a few dozen of those. Past it the list simply
+  ended — and the sync check below it then reported every document past that
+  point as "in SQLite but not in Qdrant", listing healthy, fully-present
+  documents for deletion. The scroll is now followed to the end.
+
+- **A refused Qdrant reply is no longer shown as the collection's state.**
+  The stats handler passed Qdrant's body to the browser without checking the
+  status, and a Qdrant error is valid JSON — so a missing collection, a wrong
+  api-key or a typo in `QDRANT__COLLECTION` reached the admin panel as a
+  reply with no statistics in it, and a full collection looked empty. It is
+  now a failure, and the status and body go to the log where the rest of the
+  codebase puts a 5xx's detail.
+
+- **A backup archive is now known to be complete, when it is written and
+  when it is read.** `pack_tar_gz` finalised the tar but left the gzip stream
+  to `Drop`, where flate2 discards the result: a volume that filled during the
+  last few kilobytes produced a truncated archive that still decompressed to a
+  plausible tar prefix, and the run reported success. The finalisation is now
+  awaited and the bytes flushed. Reading one back had the matching gap — the
+  tar end-of-archive marker is not the end of the gzip stream, so the CRC
+  trailer was never consulted and a truncated archive restored as though it
+  were whole. Both sides now check, and a test reads back what it just wrote.
+
+- **A restore connection that could not be put back is now closed instead of
+  pooled.** The three statements that reset it discarded their errors. If the
+  rollback failed — the same `SQLITE_BUSY` or `SQLITE_FULL` that made the copy
+  fail — the write transaction stayed open, the detach could not succeed while
+  one was, and turning foreign keys back on is a silent no-op inside a
+  transaction. The connection then went back to the pool holding the write lock
+  with foreign-key enforcement off, which is precisely what those statements
+  exist to prevent, and every later user of it inherited both with nothing to
+  show why. Each step is now checked, and a connection that could not be reset
+  is closed so the pool discards it.
+
+- **A backup run is serialized as a whole, not only its retention pass.**
+  The lock was taken inside the pass, so it protected list-and-delete against
+  another pass but not against the window between a run's write and its own
+  pass. A competing run could take the fresh archive in that window, leaving
+  the first run returning a path to a file that had just been deleted — the
+  admin answering `ok: true` for a backup that is not there. The lock is now
+  taken before the archive is written and the guard handed to the pass, so
+  list-and-delete can never overlap another run's write.
+
+- **A backup no longer leaves its snapshot behind on the Qdrant host.**
+  Qdrant keeps a copy of every snapshot it creates, and nothing here deleted
+  it — the retention quota prunes local archives only, and the only snapshot
+  endpoints this code used were the request and the download. So every daily
+  backup added a collection-sized snapshot to the Qdrant host, growing
+  without bound until that volume filled; and then the snapshot request began
+  failing, which aborts the very backup that exists to protect against exactly
+  that. Our copy is now verified and the host's is dropped, in that order, so
+  a failed verification still leaves the server-side copy for a retry. A
+  delete that fails, for whatever reason, is logged and does not fail the
+  backup.
+
+- **A Qdrant that refuses a snapshot now says so.** Neither the snapshot
+  request nor its download checked the HTTP status, so a 404 for a missing
+  collection, a 401 for a wrong api-key or a 500 had its body handed straight
+  to the JSON parser, which rejected it — leaving `error decoding response
+  body: missing field 'result'` as the only account of a failed backup, with
+  the status nowhere in it. The status is now checked before the body is
+  parsed, as the restore path in the same file already did.
+
+- **A backup works from a directory whose path contains an apostrophe.**
+  `VACUUM INTO` takes a string literal and SQLite has no backslash escape, so
+  an unescaped `'` in the path ended the literal there and the statement
+  failed. Every backup — the 02:00 one and the admin button alike — was
+  therefore impossible from a directory like `C:\Users\O'Neill\…` or an
+  iCloud/OneDrive folder with a quote in it, with nothing in the message
+  saying why. The path is now escaped exactly as the restore path already
+  was.
+
+- **Verification no longer reads a file outside the archive.** The manifest
+  inside a backup names its members, and those names were joined onto the
+  unpacked directory without checking what they were — an absolute path makes
+  `join` throw the base away. A hand-delivered archive could therefore have
+  the restore hash, and report on, any file the service can open; the digest
+  appears in the mismatch message. The name is now held to being a plain file
+  name wherever it is first consumed, the same rule the restore already
+  applied to the same two names, and the rule is stated once and tested once.
+
+- **A failed backup no longer leaves its work directory on the backup
+  volume.** The directory holding the fresh database copy — and, when Qdrant
+  answered, its snapshot too — was removed only on the success path, so six of
+  the seven ways a run can fail abandoned a full copy of the database there.
+  Nothing reclaimed it: the backup listing only shows `*.tar.gz`, and retention
+  only deletes what the listing returned, so a leftover stayed outside the
+  quota indefinitely. On a volume filling up because of the leak, the failures
+  then fed themselves. The directory is now owned by a guard that removes it on
+  every exit, successful or not, and a pack that fails part-way also removes its
+  half-written archive, which the listing would otherwise have offered for
+  restore.
+
+- **A misspelt `--bench` no longer starts the server instead.** With no
+  path after the flag, `parse_args` returns `None` and the run fell through
+  to the normal startup: the benchmark quietly became a full server, with a
+  database, a listener on port 8000 and the frontend — and no report, and
+  nothing in the log to explain its absence. A flag in the path position
+  (`--bench --bench-query "q"`) was taken for a file to benchmark, so a
+  typo sent the engine looking for a document named `--bench-query`. Both
+  now say what is missing and stop, before anything is provisioned. A
+  `--bench` with a real path is unaffected.
+
+- **The check that the committed bundle matches the source now sees added
+  files.** It compared with `git diff`, which reports nothing for an untracked
+  file, so a `frontend/dist` that gained an asset without losing one passed
+  with a bundle no build produces. It now stages the directory and compares
+  the index.
+
+- **A document row that was not written is no longer reported as written.**
+  The insert used `INSERT OR IGNORE`, but the id is a fresh UUID per upload and
+  is the table's only unique column, so there was nothing for it to ignore: it
+  could only mask the one failure that must not be masked. An ignored insert
+  returns success, the upload is reported as done, and its vectors are already
+  in Qdrant — leaving an orphan with no row for the delete path to reach.
+  Uploading the same file twice is unaffected: only the id is unique.
+
+- **A generation that fails mid-stream is no longer stored as a
+  complete answer.** eullm reports a failure part-way through by writing an
+  `error` object on its own line of the NDJSON stream, which is not a chunk
+  and so did not parse. It was skipped like any other unrecognised line,
+  which ended the stream *cleanly* — and a cleanly-ended stream is persisted
+  as the model's reply, so a context-length overflow or an OOM halfway
+  through left the user with a silently truncated answer that came back as
+  authoritative on every later reload, and was replayed into the prompt as
+  history. Such a line now ends the stream the way a severed connection
+  does, so the partial text is shown but not saved. Lines that are not a
+  recognised error are still skipped, so a newer eullm cannot cut a good
+  answer short.
+
+- **A source citation can be opened again.** The filename under an answer
+  was a plain link to the download endpoint, and a link click sends no
+  `Authorization` header — while the API authenticates on
+  `Authorization: Bearer` only, with no session cookie to fall back on. So
+  clicking the document an answer came from navigated to the endpoint, got a
+  401, and handed the user a JSON error body named after the file. Citations
+  now fetch the original with the token and save it, under the name the
+  server stored.
+
+- **Logging out no longer leaves the next login with a disabled
+  interface.** The "something is running" flags belonged to the request, not
+  to the session, and only that request's own cleanup cleared them. Signing
+  out during an answer left the question box and the send button disabled
+  until the abandoned stream ended — up to its ten-minute abort — and
+  signing out during an upload left the file picker disabled for as long as
+  the upload ran, with the previous session's "Processing (OCR → Chunking →
+  Embedding)" banner still on screen. Those flags are now cleared on logout,
+  and a stream that no longer owns the view stops writing to it instead of
+  appending into whatever the next session is looking at.
+
+- **A partial answer survives a dropped connection.** When the SSE stream
+  died after tokens had already arrived — a proxy reset, a laptop lid
+  closing, the abort that ends a very long generation — the frontend threw
+  the streamed text away and replaced it with `Error: ...`, so a long
+  answer the user had just watched arrive vanished, and because the
+  backend never persists a severed answer, a reload could not bring it
+  back. The text is now kept and the failure appended after it, which is
+  what the backend's own `{ error }` event already did.
+
+- **Switching conversation mid-answer no longer writes into the wrong
+  thread.** The conversation list stays clickable while a reply streams in,
+  and every arriving token was appended to the last message on screen. So
+  leaving a conversation mid-answer spliced the rest of the answer into
+  the one opened instead, and coming back before it finished appended it
+  to the question itself, since the reloaded list has the question but not
+  yet the answer. The stream now stops writing to the screen as soon as the
+  conversation changes; if you are back on it when the answer is complete,
+  the conversation is reloaded with the full answer. First reported, and
+  fixed for the switch away, in #86.
+
+- **A conversation title is never cut in half a character.** The automatic
+  title truncated with `substring(0, 50)`, which counts UTF-16 code units, so
+  a question containing a character outside the basic plane — an emoji, rarer
+  CJK, some Indic conjuncts, two units each — was cut between the halves at
+  position 49 or 50, and the stored title carried a lone surrogate that every
+  renderer draws as `�`. The cut is now on a code point.
+
+- **A retrieved chunk is no longer rewritten by the prompt template.** The
+  prompt was assembled with a chain of `str::replace` calls, each scanning
+  what the previous one had produced. Any chunk or stored message containing
+  the literal text `{question}` or `{context}` — a template guide, a config
+  file, a document *about* this project — had that token replaced by the
+  user's question, inside the evidence the model was shown. The evidence
+  stopped being what the document says, and the text the user asked about
+  appeared in the middle of it. Substitution now happens in a single pass
+  over the template, so an inserted value is never scanned again. The prompt
+  is byte-for-byte what it was for any document that does not contain the
+  tokens.
+
+- **A restore applies the members the archive's manifest names, and
+  refuses an archive of another collection.** Verification and restore
+  disagreed about where the members are: the manifest was hashed under the
+  names it gives, then the files were looked for under names rebuilt from the
+  current configuration. Rename `QDRANT__COLLECTION`, or move an archive to
+  another installation, and the snapshot was verified and then never found —
+  the run reported success and only the database came back. The two now agree
+  by construction, and an archive whose manifest names a different collection
+  is refused before anything is written rather than uploaded into the wrong
+  one. A restore that finds no database at all is an error, not a successful
+  restore of nothing, and it is refused before the snapshot is uploaded rather
+  than after; the collection name was already in every manifest and was read
+  by nothing.
+
+- **An upload that cannot record its metadata does not leave its vectors
+  behind.** Ingestion wrote the chunks to Qdrant first and the SQLite row
+  second, with nothing between them: a failing insert left a document whose
+  vectors were still retrieved by every query and still quoted as a source
+  pointing at an id that resolves to nothing, while the document list — read
+  from SQLite — never showed it. So there was no id to delete them by and no
+  way to reach them again short of rebuilding the collection. The vectors are
+  now removed again when the insert fails, which is the same invariant
+  `purge_document` already states for the delete path — and when the Qdrant
+  write itself fails part-way, which on a document of more than 1000 chunks
+  left the batches already written behind in the same way.
+
+### Security
+
+- **`axios` 1.20.0 in the web interface.** The bundled 1.18.1 fell under
+  twelve advisories fixed in 1.20.0. Most concern Node's HTTP adapters,
+  which a browser bundle never loads; the rest are prototype-pollution
+  gadgets and header injection through inherited properties, reachable only
+  together with a pollution bug elsewhere in the page. `frontend/dist` is
+  rebuilt with it. The build tooling is refreshed within its ranges as well
+  (`postcss` 8.5.28, `browserslist` 4.29.3, `nanoid` 3.3.19). `vite` 4 and
+  its `esbuild` stay: their advisories concern the development server, and
+  the fix is the major upgrade to `vite` 8, which deserves a change of its
+  own.
+
+- **`event-listener` 5.4.2, for RUSTSEC-2026-0221.** 5.4.1 let a
+  `!Send` tag cross threads through its stack-allocated listener: a data
+  race in safe code. It reaches this server through sqlx, which uses
+  neither tags nor that listener, so nothing here could trigger it; the
+  bump clears the warning `cargo audit` raised. It also drops
+  `concurrent-queue` from the lockfile.
+
+---
+
 ## [0.1.46] - 2026-09-25
 
 ### Added
