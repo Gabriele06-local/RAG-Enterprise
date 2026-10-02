@@ -234,8 +234,8 @@ async fn scroll_all_documents(
             "with_payload": true,
             "with_vector": false,
         });
-        if let Some(at) = offset {
-            body["offset"] = json!(at);
+        if let Some(at) = &offset {
+            body["offset"] = at.clone();
         }
         let resp = client
             .post(&url)
