@@ -385,7 +385,9 @@ mod tests {
                                     { "payload": { "document_id": "doc-b", "filename": "b.pdf",
                                                    "upload_date": "2026-01-02T00:00:00Z" } },
                                 ],
-                                "next_page_offset": 2,
+                                // Point ids here are UUIDs, so the offset is a
+                                // string, as Qdrant returns it for them.
+                                "next_page_offset": "3f2b8c1e-7d4a-4e9b-9a6f-2c1d0e5b7a91",
                             }
                         })
                     };
