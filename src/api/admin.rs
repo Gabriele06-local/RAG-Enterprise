@@ -177,14 +177,40 @@ fn is_bad_request(e: &anyhow::Error) -> bool {
 
 // ── GET /api/admin/qdrant/stats ───────────────────────────────────────────────
 
+/// What to do with a Qdrant collection-info reply.
+///
+/// Split out from the handler so the rule is testable without a Qdrant: a
+/// non-success status is a 502 carrying the status and the body, and only a
+/// success is handed to the browser as the collection's state.
+fn collection_info_response(status: reqwest::StatusCode, body: String) -> Response {
+    if status.is_success() {
+        return match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(value) => Json(value).into_response(),
+            Err(e) => err(StatusCode::BAD_GATEWAY, e),
+        };
+    }
+    err(
+        StatusCode::BAD_GATEWAY,
+        format!("Qdrant refused the collection info ({status}): {body}"),
+    )
+}
+
 pub async fn qdrant_stats(State(state): State<AppState>, claims: Claims) -> Response {
     if let Some(r) = require_admin(&claims) { return r; }
     let url = format!("{}/collections/{}", state.settings.qdrant.url, state.settings.qdrant.collection);
     match reqwest::get(&url).await {
-        Ok(r) => match r.json::<serde_json::Value>().await {
-            Ok(body) => Json(body).into_response(),
-            Err(e) => err(StatusCode::BAD_GATEWAY, e),
-        },
+        // The status is checked before the body is passed on. This handler is
+        // the one place a Qdrant reply reaches the browser verbatim, so a 404
+        // ("Not found: collection …") or a 401 was rendered by the admin panel
+        // as if it were the collection's real state: an error object where the
+        // tab expects result.points_count, which reads as "0 points" for a
+        // collection that is full. The rest of this file reports the status and
+        // the body; this now does too.
+        Ok(r) => {
+            let status = r.status();
+            let body = r.text().await.unwrap_or_default();
+            collection_info_response(status, body)
+        }
         Err(e) => err(StatusCode::BAD_GATEWAY, e),
     }
 }
@@ -339,6 +365,7 @@ pub async fn sqlite_documents(State(state): State<AppState>, claims: Claims) -> 
 
 #[cfg(test)]
 mod tests {
+    use super::collection_info_response;
     use super::is_bad_request;
     use super::scroll_all_documents;
 
@@ -426,6 +453,47 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(chunks("doc-b"), 2, "a document spanning two pages is counted once per chunk");
+    }
+
+    /// Qdrant's error objects are valid JSON, so parsing one used to succeed and
+    /// the panel was handed `{"status": {"error": "Not found: collection …"}}`
+    /// where it looks for `result.points_count` — which reads as "0 points" and
+    /// "0 vectors". A full collection, a wrong api-key and a typo in
+    /// QDRANT__COLLECTION all looked like an empty one.
+    ///
+    /// The distinction that matters is 200 against not-200: a refusal must not
+    /// be rendered as the collection's state. The status and body go to the log
+    /// rather than to the caller, which is this codebase's standing rule for
+    /// 5xx — the point is that the panel shows a failure, not a plausible lie.
+    #[tokio::test]
+    async fn a_refused_collection_info_is_never_passed_through_as_state() {
+        let error_body =
+            r#"{"status":{"error":"Not found: collection `rag_documents` doesn't exist!","status":"error"}}"#
+                .to_owned();
+        let refused = collection_info_response(reqwest::StatusCode::NOT_FOUND, error_body);
+        assert_eq!(refused.status(), axum::http::StatusCode::BAD_GATEWAY);
+        let text = axum::body::to_bytes(refused.into_body(), 64 * 1024).await.unwrap();
+        let reported = String::from_utf8_lossy(&text);
+        assert!(
+            !reported.contains("doesn't exist"),
+            "Qdrant's error object must not reach the browser as if it were state: {reported}"
+        );
+
+        // And a real reply, with the same shape Qdrant really returns, still
+        // goes through untouched.
+        let ok = r#"{"result":{"status":"green","points_count":42,"vectors_count":42}}"#;
+        let passed = collection_info_response(reqwest::StatusCode::OK, ok.to_owned());
+        assert_eq!(passed.status(), axum::http::StatusCode::OK);
+        let text = axum::body::to_bytes(passed.into_body(), 64 * 1024).await.unwrap();
+        assert!(String::from_utf8_lossy(&text).contains("\"points_count\":42"));
+    }
+
+    /// A 200 that is not the expected shape is an error, not a blank tab that
+    /// reads as "no vectors".
+    #[tokio::test]
+    async fn a_successful_but_unparsable_reply_is_a_502() {
+        let response = collection_info_response(reqwest::StatusCode::OK, "not json".to_owned());
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
     }
 
     fn bad(msg: &str) -> anyhow::Error {
