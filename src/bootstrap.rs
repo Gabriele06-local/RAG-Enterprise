@@ -2915,7 +2915,7 @@ mod state_write_tests {
     /// The happy path still has to round-trip: the stamp is only a fast path,
     /// so a regression here shows up as a slow start rather than a failure,
     /// which is exactly the kind of regression that goes unnoticed.
-#[tokio::test]
+    #[tokio::test]
     async fn write_stamp_round_trips_through_verify_component() {
         let dir = scratch("stamp_round_trip");
         let dest = dir.join("component");
