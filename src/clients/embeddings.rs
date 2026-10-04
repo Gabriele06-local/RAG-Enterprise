@@ -188,7 +188,7 @@ impl EmbeddingService {
         // Through the accessor, not the field: `info` reads the label and the
         // status together, and they must not disagree - a machine that fell
         // back at request time has to read as a fallback in both.
-label_for(self.device_status())
+        label_for(self.device_status())
     }
 
     pub fn model_id(&self) -> &str {
