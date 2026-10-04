@@ -2868,7 +2868,7 @@ mod stale_process_tests {
 mod state_write_tests {
     use super::*;
 
-/// A data dir with the layout `bootstrap_data_dir` establishes, `bin/`
+    /// A data dir with the layout `bootstrap_data_dir` establishes, `bin/`
     /// included: the override lives under it and nothing here creates it.
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("i3k_bootstrap_state_{name}"));
