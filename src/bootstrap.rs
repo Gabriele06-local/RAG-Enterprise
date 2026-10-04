@@ -2056,12 +2056,19 @@ async fn kill_stale_process(bin: &Path) {
         // error that points at the port instead of at the instance sitting on
         // it. Silent, that is the hardest kind to diagnose.
         if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } != 0 {
-            tracing::warn!(
-                pid,
-                bin = %target.display(),
-                error = %std::io::Error::last_os_error(),
-                "could not signal a stale instance - it may go on holding its port"
-            );
+            // Read first: the log call below may itself change errno.
+            let error = std::io::Error::last_os_error();
+            // ESRCH is the process exiting between the readlink and the
+            // signal - the outcome we wanted. Anything else, EPERM above all,
+            // leaves it running.
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                tracing::warn!(
+                    pid,
+                    bin = %target.display(),
+                    error = %error,
+                    "could not signal a stale instance - it may go on holding its port"
+                );
+            }
         }
     }
     // Brief pause so the kernel can release the port.
