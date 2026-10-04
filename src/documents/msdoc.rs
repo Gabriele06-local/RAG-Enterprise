@@ -49,8 +49,14 @@ const MAX_FIELD_DEPTH: usize = 64;
 pub fn extract_text(path: &Path, max_bytes: u64) -> Result<String> {
     let file =
         std::fs::File::open(path).with_context(|| format!("opening doc {}", path.display()))?;
-    // No stream in the container can legitimately be longer than the file.
-    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    // No stream in the container can legitimately be longer than the file. A
+    // size we could not read is not a size of zero: with one, every stream
+    // would be read as empty and the .doc would come back as an empty
+    // document rather than as the failure it is.
+    let file_len = file
+        .metadata()
+        .with_context(|| format!("reading the size of {}", path.display()))?
+        .len();
     let mut cfb = cfb::CompoundFile::open(file).with_context(|| {
         format!(
             "doc is not a readable OLE compound file: {}",
