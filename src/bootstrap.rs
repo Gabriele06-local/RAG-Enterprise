@@ -2309,6 +2309,42 @@ fn probe_total(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         .filter(|&total| total > 0)
 }
 
+/// The probe is what decides whether a parallel download can happen at all, so
+/// the one thing `probe_total` must never do is invent a size - least of all
+/// zero, which the caller would take as "stream the probe response", the probe
+/// being the single byte `Range: bytes=0-0` asked for.
+#[cfg(test)]
+mod probe_total_tests {
+    use super::*;
+    use reqwest::header::{HeaderMap, CONTENT_RANGE};
+
+    fn with_range(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_RANGE, value.parse().expect("a header value"));
+        headers
+    }
+
+    #[test]
+    fn the_size_is_taken_from_the_content_range_of_the_probe() {
+        assert_eq!(probe_total(&with_range("bytes 0-0/1234")), Some(1234));
+        // A multi-range answer would still end in the total.
+        assert_eq!(probe_total(&with_range("bytes 0-1233/1234")), Some(1234));
+    }
+
+    #[test]
+    fn a_probe_that_says_nothing_usable_reports_no_size() {
+        // Absent: a 206 without it, which broken proxies do send.
+        assert_eq!(probe_total(&HeaderMap::new()), None);
+        // `*` is the legal way to say "I will not say".
+        assert_eq!(probe_total(&with_range("bytes 0-0/*")), None);
+        // A zero total is not a file to divide into chunks.
+        assert_eq!(probe_total(&with_range("bytes 0-0/0")), None);
+        // Nonsense, and a size that does not fit the type.
+        assert_eq!(probe_total(&with_range("bytes 0-0/lots")), None);
+        assert_eq!(probe_total(&with_range("garbage")), None);
+    }
+}
+
 async fn parallel_download(url: &str, dest: &Path, display_name: &str, n: usize) -> Result<()> {
     // http1_only: if the server negotiates HTTP/2, reqwest would multiplex the
     // N "concurrent" Range requests over the SAME TCP connection — no real
