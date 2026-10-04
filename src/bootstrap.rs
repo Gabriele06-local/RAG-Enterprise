@@ -2475,7 +2475,10 @@ async fn parallel_download(url: &str, dest: &Path, display_name: &str, n: usize)
             last_done = done;
             last_tick = now;
             let eta = if rate > 0.0 {
-                fmt_eta(((total - done) as f64 / rate) as u64)
+                // saturating, not `-`: a server that over-delivers a piece can
+                // put `done` past `total`, and that must read as "no time left"
+                // rather than wrap around to a number no one believes.
+                fmt_eta((total.saturating_sub(done) as f64 / rate) as u64)
             } else {
                 "…".to_owned()
             };
@@ -2769,11 +2772,172 @@ async fn fetch_chunk_once(
     let mut buf: Vec<u8> = Vec::with_capacity(expected);
     let mut guard = ProgressGuard::new(downloaded);
     while let Some(chunk) = resp.chunk().await.context("chunk read")? {
+        // A body past the piece is not the piece: stop at once rather than
+        // buffer the rest - from a server ignoring Range that is the whole
+        // file, once per parallel worker.
+        if buf.len() + chunk.len() > expected {
+            bail!(
+                "the server sent more than the {expected} bytes bytes={start}-{end} asks for: \
+                 it is not honouring Range, and writing that at offset {start} would corrupt \
+                 the file"
+            );
+        }
         guard.add(chunk.len() as u64);
         buf.extend_from_slice(&chunk);
     }
+    // The warning above is not the end of the matter: these bytes are about to
+    // be written at `start`, so a body that is not the piece that was asked
+    // for does not merely waste bandwidth, it overwrites the pieces that come
+    // after it. A server honouring Range sends exactly the range it was asked
+    // for, so the length is what tells the two apart - and `expected` is
+    // already computed for the capacity above.
+    //
+    // Failing here rather than after the write is what keeps the file intact,
+    // and it hands the piece to the retry loop above instead: dropping the
+    // guard rolls its bytes back out of the progress counter.
+    if buf.len() != expected {
+        bail!(
+            "the server sent {} bytes where bytes={start}-{end} asks for {expected}: it is not \
+             honouring Range, and writing that at offset {start} would corrupt the file",
+            buf.len()
+        );
+    }
     guard.commit();
     Ok(buf)
+}
+
+/// A server that does not honour Range is the case `fetch_chunk_once` has to
+/// refuse: it answers `200` with the whole file where a piece was asked for,
+/// and those bytes would then be written at the piece's offset, over every
+/// piece after it. The pieces are fetched concurrently, so the file is not even
+/// reliably self-consistent - only the sha256 check downstream would notice,
+/// and the eullm self-update has none.
+#[cfg(test)]
+mod download_chunk_tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const FILE: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+
+    /// The `bytes=start-end` out of a raw request, if it carries one.
+    fn range_of(request: &str) -> Option<(u64, u64)> {
+        let at = request.find("bytes=")? + "bytes=".len();
+        let (range, _) = request[at..].split_once(char::is_whitespace)?;
+        let (start, end) = range.split_once('-')?;
+        Some((start.parse().ok()?, end.parse().ok()?))
+    }
+
+    /// Serves `FILE`, answering a `Range` with the `206` it asks for when
+    /// `honour_range`, and the whole file with a `200` when not.
+    async fn serve(listener: tokio::net::TcpListener, honour_range: bool) {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let read = stream.read(&mut buf).await.unwrap_or(0);
+                let asked = String::from_utf8_lossy(&buf[..read]).to_string();
+                let mut response = match honour_range.then(|| range_of(&asked)).flatten() {
+                    Some((start, end)) => {
+                        let slice = &FILE[start as usize..=end as usize];
+                        let mut out = format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            FILE.len(),
+                            slice.len()
+                        )
+                        .into_bytes();
+                        out.extend_from_slice(slice);
+                        out
+                    }
+                    None => {
+                        let mut out = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            FILE.len()
+                        )
+                        .into_bytes();
+                        out.extend_from_slice(FILE);
+                        out
+                    }
+                };
+                response.push(b'\n');
+                let _ = stream.write_all(&response).await;
+                let _ = stream.flush().await;
+            });
+        }
+    }
+
+    fn client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .http1_only()
+            .build()
+            .expect("client")
+    }
+
+    /// A path of our own for this test, emptied first. Bound once and reused: a
+    /// helper that deleted on every call would delete what the test just wrote.
+    fn fresh_file(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("i3k_piece_{name}"));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    #[tokio::test]
+    async fn a_piece_that_is_the_piece_is_accepted() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/f", listener.local_addr().unwrap());
+        tokio::spawn(serve(listener, true));
+
+        let path = fresh_file("piece_ok");
+        let file = Arc::new(std::fs::File::create(&path).unwrap());
+        let downloaded = Arc::new(AtomicU64::new(0));
+        download_chunk(client(), url, Arc::clone(&file), 10, 19, Arc::clone(&downloaded))
+            .await
+            .expect("a server honouring Range must be accepted");
+
+        assert_eq!(downloaded.load(Ordering::Relaxed), 10, "only the piece counts");
+        let written = std::fs::read(&path).unwrap();
+        assert_eq!(&written[10..20], b"abcdefghij", "the piece lands at its own offset");
+    }
+
+    #[tokio::test]
+    async fn a_piece_that_is_the_whole_file_is_refused_and_nothing_is_written() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/f", listener.local_addr().unwrap());
+        tokio::spawn(serve(listener, false));
+
+        let path = fresh_file("piece_whole");
+        let file = Arc::new(std::fs::File::create(&path).unwrap());
+        let downloaded = Arc::new(AtomicU64::new(0));
+        // Ten bytes are asked for; the server answers with all thirty-six.
+        let err = download_chunk(client(), url, Arc::clone(&file), 10, 19, Arc::clone(&downloaded))
+            .await
+            .expect_err("a body that is not the piece must not be written");
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("honouring Range"),
+            "the error should say the Range was not honoured: {message}"
+        );
+        assert_eq!(
+            downloaded.load(Ordering::Relaxed),
+            0,
+            "the bytes of a refused piece are rolled back out of the progress counter"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            0,
+            "nothing may be written at the piece's offset"
+        );
+    }
+
+    /// The progress line is where an over-delivered piece shows up first:
+    /// `done` past `total` must read as "no time left", not wrap around.
+    #[test]
+    fn a_progress_counter_past_the_total_does_not_wrap() {
+        let (total, done) = (100u64, 130u64);
+        assert!(total.checked_sub(done).is_none(), "plain `-` would have wrapped");
+        assert_eq!(total.saturating_sub(done), 0);
+    }
 }
 
 // ── Formatters ─────────────────────────────────────────────────────────────
