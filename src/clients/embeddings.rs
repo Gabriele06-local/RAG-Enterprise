@@ -58,7 +58,46 @@ pub struct EmbeddingService {
     tokenizer: Tokenizer,
     device: Device,
     device_status: DeviceStatus,
+    /// Set when a batch had to be retried on the CPU because CUDA failed while
+    /// embedding, rather than at load time.
+    ///
+    /// Interior mutability because embedding takes `&self`: the service is
+    /// shared behind a read lock and has to stay usable from every thread that
+    /// asks a question. What is recorded is the fact, not a fix - see
+    /// `reported_status` for what it changes.
+    degraded: std::sync::atomic::AtomicBool,
     model_id: String,
+}
+
+/// What `device_status` reports, given how the service was configured and
+/// whether a batch has since had to fall back to the CPU.
+///
+/// A fallback that happens at request time is as much a degradation as one at
+/// startup, and it is the one an operator cannot see coming: startup shouts
+/// about it, `info` reports it, and this path could do neither. `CpuParked` is
+/// the exception - being on the CPU between ingestion windows is the design,
+/// not a failure - so a batch falling back while parked still reads as parked.
+fn reported_status(configured: DeviceStatus, degraded: bool) -> DeviceStatus {
+    match (configured, degraded) {
+        (DeviceStatus::CpuParked, _) => DeviceStatus::CpuParked,
+        (_, true) => DeviceStatus::CpuFallback,
+        (status, false) => status,
+    }
+}
+
+/// The label `info` publishes for a status.
+///
+/// The fallback text deliberately does not say *when* CUDA failed: it now
+/// covers a batch that ran out of memory at request time as well as a load
+/// that failed at startup, and naming only the latter would send an operator
+/// looking in the boot log for a machine that booted fine.
+fn label_for(status: DeviceStatus) -> &'static str {
+    match status {
+        DeviceStatus::Gpu => "gpu",
+        DeviceStatus::CpuByConfig => "cpu (built without GPU support)",
+        DeviceStatus::CpuFallback => "cpu (FALLBACK: CUDA is not being used, see the log)",
+        DeviceStatus::CpuParked => "cpu (parked - VRAM reserved for eullm outside ingestion)",
+    }
 }
 
 impl EmbeddingService {
@@ -139,16 +178,17 @@ impl EmbeddingService {
     }
 
     pub fn device_status(&self) -> DeviceStatus {
-        self.device_status
+        reported_status(
+            self.device_status,
+            self.degraded.load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     pub fn device_label(&self) -> &'static str {
-        match self.device_status {
-            DeviceStatus::Gpu => "gpu",
-            DeviceStatus::CpuByConfig => "cpu (built without GPU support)",
-            DeviceStatus::CpuFallback => "cpu (FALLBACK: CUDA failed at startup, see the log)",
-            DeviceStatus::CpuParked => "cpu (parked — VRAM reserved for eullm outside ingestion)",
-        }
+        // Through the accessor, not the field: `info` reads the label and the
+        // status together, and they must not disagree - a machine that fell
+        // back at request time has to read as a fallback in both.
+        label_for(self.device_status())
     }
 
     pub fn model_id(&self) -> &str {
@@ -239,6 +279,7 @@ impl EmbeddingService {
             tokenizer,
             device: device.clone(),
             device_status: DeviceStatus::CpuByConfig,
+            degraded: std::sync::atomic::AtomicBool::new(false),
             model_id: model_id.to_owned(),
         })
     }
@@ -257,6 +298,13 @@ impl EmbeddingService {
             let mut rows = self.embed_batch(chunk).or_else(|e| {
                 if device_is_cuda(&self.device) {
                     tracing::warn!("CUDA out of memory, retrying on CPU: {e:#}");
+                    // The batch still gets embedded, so nothing here fails and
+                    // nobody is told - except now `info` reports the fallback
+                    // instead of "gpu", which is the whole point of the flag.
+                    // It keeps being set for the life of the service: this is a
+                    // standing property of the machine, not of one batch.
+                    self.degraded
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     self.embed_batch_on(chunk, &Device::Cpu)
                 } else {
                     Err(e)
@@ -517,5 +565,76 @@ mod tests {
             !msg.contains("REQUIRE_GPU"),
             "without require_gpu the error must not mention REQUIRE_GPU: {msg}"
         );
+    }
+}
+
+/// What `info` shows is the only place an operator learns that a machine has
+/// quietly stopped using its GPU, so the mapping from "a batch fell back" to
+/// "reported as a fallback" is the whole point of the flag and is pinned here.
+#[cfg(test)]
+mod reported_status_tests {
+    use super::*;
+
+    #[test]
+    fn a_runtime_fallback_is_reported_wherever_it_can_be_seen() {
+        // The GPU case is the one that matters: `info` compares against
+        // CpuFallback to decide `embedding_device_ok`, so a degradation that
+        // stayed invisible here would report a healthy GPU forever.
+        assert_eq!(
+            reported_status(DeviceStatus::Gpu, true),
+            DeviceStatus::CpuFallback
+        );
+    }
+
+    #[test]
+    fn without_a_fallback_the_configured_status_still_stands() {
+        for status in [
+            DeviceStatus::Gpu,
+            DeviceStatus::CpuByConfig,
+            DeviceStatus::CpuParked,
+            DeviceStatus::CpuFallback,
+        ] {
+            assert_eq!(reported_status(status, false), status);
+        }
+    }
+
+    #[test]
+    fn parked_is_not_a_degradation_even_if_a_batch_had_to_fall_back() {
+        // CpuParked means "on the CPU between ingestion windows", which is the
+        // design: the VRAM is reserved for eullm on purpose. A batch running on
+        // the CPU while parked therefore found it already there, and reporting
+        // CpuFallback would cry wolf on every swap-in.
+        assert_eq!(
+            reported_status(DeviceStatus::CpuParked, true),
+            DeviceStatus::CpuParked
+        );
+    }
+
+    /// The label is what an operator actually reads, so the degradation has to
+    /// be visible in the text - and it must not blame the boot log, because a
+    /// runtime fallback happens on a machine that started up perfectly.
+    #[test]
+    fn the_label_of_a_reported_fallback_says_the_gpu_is_not_being_used() {
+        let label = label_for(reported_status(DeviceStatus::Gpu, true));
+        assert!(label.contains("FALLBACK"), "the label must flag it: {label}");
+        assert!(
+            !label.contains("at startup"),
+            "a runtime fallback must not be blamed on startup: {label}"
+        );
+    }
+
+    /// `info` reads the label and the status in the same breath; a pair that
+    /// disagrees is worse than either alone.
+    #[test]
+    fn the_label_and_the_status_never_disagree() {
+        for degraded in [false, true] {
+            let status = reported_status(DeviceStatus::Gpu, degraded);
+            let label = label_for(status);
+            assert_eq!(
+                label.contains("FALLBACK"),
+                status == DeviceStatus::CpuFallback,
+                "degraded={degraded}: status={status:?} label={label:?}"
+            );
+        }
     }
 }

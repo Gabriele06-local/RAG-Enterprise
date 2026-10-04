@@ -40,8 +40,14 @@ const ENCRYPTED_TOKEN: u32 = 0xF3D1_C4DF;
 pub fn extract_text(path: &Path) -> Result<String> {
     let file =
         std::fs::File::open(path).with_context(|| format!("opening ppt {}", path.display()))?;
-    // No stream in the container can legitimately be longer than the file.
-    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    // No stream in the container can legitimately be longer than the file. A
+    // size we could not read is not a size of zero: with one, `take(0)` below
+    // would read nothing and the deck would come back as an empty document
+    // rather than as the failure it is.
+    let file_len = file
+        .metadata()
+        .with_context(|| format!("reading the size of {}", path.display()))?
+        .len();
     let mut cfb = cfb::CompoundFile::open(file).with_context(|| {
         format!(
             "ppt is not a readable OLE compound file: {}",
