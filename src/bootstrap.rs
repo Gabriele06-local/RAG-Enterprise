@@ -2048,7 +2048,21 @@ async fn kill_stale_process(bin: &Path) {
         }
         tracing::info!(pid, bin = %target.display(), "killing stale instance");
         // SIGTERM, the same signal pkill sent by default.
-        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        //
+        // The return value is what says whether the port is actually free
+        // now. A process that has already gone (ESRCH) is what we wanted, but
+        // one we are not allowed to signal (EPERM, another user's) is still
+        // holding 6333, and the spawn after this then fails to bind with an
+        // error that points at the port instead of at the instance sitting on
+        // it. Silent, that is the hardest kind to diagnose.
+        if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } != 0 {
+            tracing::warn!(
+                pid,
+                bin = %target.display(),
+                error = %std::io::Error::last_os_error(),
+                "could not signal a stale instance - it may go on holding its port"
+            );
+        }
     }
     // Brief pause so the kernel can release the port.
     tokio::time::sleep(Duration::from_millis(800)).await;
