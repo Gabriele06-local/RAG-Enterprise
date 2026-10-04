@@ -2712,6 +2712,16 @@ async fn fetch_chunk_once(
     let mut buf: Vec<u8> = Vec::with_capacity(expected);
     let mut guard = ProgressGuard::new(downloaded);
     while let Some(chunk) = resp.chunk().await.context("chunk read")? {
+        // A body past the piece is not the piece: stop at once rather than
+        // buffer the rest - from a server ignoring Range that is the whole
+        // file, once per parallel worker.
+        if buf.len() + chunk.len() > expected {
+            bail!(
+                "the server sent more than the {expected} bytes bytes={start}-{end} asks for: \
+                 it is not honouring Range, and writing that at offset {start} would corrupt \
+                 the file"
+            );
+        }
         guard.add(chunk.len() as u64);
         buf.extend_from_slice(&chunk);
     }
