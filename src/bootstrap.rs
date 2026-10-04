@@ -1178,7 +1178,7 @@ async fn verify_and_place(comp: &Component, partial: &Path, dest: &Path) -> Resu
     tokio::fs::rename(partial, dest)
         .await
         .with_context(|| format!("rename {}", dest.display()))?;
-    write_stamp(dest, &got).await;
+    stamp_installed(dest, &got, &comp.name).await;
     Ok(())
 }
 
@@ -1237,7 +1237,7 @@ async fn extract_and_verify_member(
     tokio::fs::rename(&extracted, dest)
         .await
         .with_context(|| format!("rename {}", dest.display()))?;
-    write_stamp(dest, &got).await;
+    stamp_installed(dest, &got, &comp.name).await;
     Ok(())
 }
 
@@ -1371,7 +1371,7 @@ async fn ensure_component_dir(comp: &Component, dest: &Path) -> Result<()> {
     if comp.exec {
         set_executable(dest).await.with_context(|| format!("chmod +x {}", dest.display()))?;
     }
-    write_stamp(dest, &got).await;
+    stamp_installed(dest, &got, &comp.name).await;
 
     tracing::info!("{}: installed at {}", comp.name, dest.display());
     Ok(())
@@ -1436,7 +1436,7 @@ async fn verify_component(comp: &Component, dest: &Path) -> Result<bool> {
     .context("sha256 verify")?;
 
     if got == expected {
-        write_stamp(dest, &got).await;
+        stamp_installed(dest, &got, &comp.name).await;
         Ok(true)
     } else {
         tracing::warn!(
@@ -1455,8 +1455,31 @@ fn stamp_path(dest: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
-async fn write_stamp(dest: &Path, hash: &str) {
-    let _ = tokio::fs::write(stamp_path(dest), hash).await;
+/// Records the digest of the file now installed at `dest`.
+///
+/// The file is already in place and verified, so a failure here is no reason
+/// to fail a bootstrap that otherwise worked. It is not free either:
+/// `verify_component` trusts the stamp when it is there and falls back to
+/// rehashing the whole file when it is not, which is tens of seconds for the
+/// 2.1GB bge-m3 GGUF, on every start, until a stamp finally lands.
+async fn write_stamp(dest: &Path, hash: &str) -> Result<()> {
+    let path = stamp_path(dest);
+    tokio::fs::write(&path, hash)
+        .await
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+/// `write_stamp` for a component that is installed and verified: keep going,
+/// but do not let a lost stamp pass unnoticed.
+async fn stamp_installed(dest: &Path, hash: &str, name: &str) {
+    if let Err(e) = write_stamp(dest, hash).await {
+        tracing::warn!(
+            error = ?e,
+            "{name}: installed at {}, but its stamp could not be written - every start will rehash \
+             the file until one can",
+            dest.display()
+        );
+    }
 }
 
 async fn remove_stamp(dest: &Path) {
@@ -1562,16 +1585,37 @@ fn eullm_override_path(data_dir: &Path) -> PathBuf {
 }
 
 async fn load_eullm_override(data_dir: &Path) -> EullmOverride {
-    match tokio::fs::read_to_string(eullm_override_path(data_dir)).await {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+    let path = eullm_override_path(data_dir);
+    match tokio::fs::read_to_string(&path).await {
+        Ok(s) => match serde_json::from_str(&s) {
+            Ok(ov) => ov,
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    "eullm: {} could not be parsed, falling back to the manifest pin",
+                    path.display()
+                );
+                EullmOverride::default()
+            }
+        },
         Err(_) => EullmOverride::default(),
     }
 }
 
-async fn save_eullm_override(data_dir: &Path, ov: &EullmOverride) {
-    if let Ok(s) = serde_json::to_string_pretty(ov) {
-        let _ = tokio::fs::write(eullm_override_path(data_dir), s).await;
-    }
+/// Persists the override, reporting a failure rather than swallowing it.
+///
+/// Losing this file is not a no-op. With no `installed_version` recorded,
+/// `effective_eullm_component` falls back to the manifest pin - whose sha256
+/// is not the one just installed - so the next start rehashes the new binary,
+/// calls it a mismatch, and downloads the pinned build back over the version
+/// the operator just approved. That is a silent revert and a wasted download,
+/// which is why the write is fallible here and reported by every caller.
+async fn save_eullm_override(data_dir: &Path, ov: &EullmOverride) -> Result<()> {
+    let path = eullm_override_path(data_dir);
+    let s = serde_json::to_string_pretty(ov).context("serialising the eullm override")?;
+    tokio::fs::write(&path, s)
+        .await
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 /// "0.6.6" / "v0.6.6" / "EuLLM-v0.6.6" → (0,6,6). None when the format does
@@ -1627,7 +1671,11 @@ async fn effective_eullm_component(pinned: &Component, data_dir: &Path) -> Compo
             "eullm: the manifest pin has caught up with the local override, falling back to the pin"
         );
         ov = EullmOverride::default();
-        save_eullm_override(data_dir, &ov).await;
+        if let Err(e) = save_eullm_override(data_dir, &ov).await {
+            // The pin is already in effect in memory, so this start is right.
+            // The stale file survives to be reset again next time.
+            tracing::warn!(error = ?e, "eullm: could not clear the obsolete override file");
+        }
     }
 
     match (&ov.installed_version, &ov.installed_sha256, &ov.installed_url) {
@@ -1743,8 +1791,14 @@ async fn maybe_update_eullm(pinned: &Component, dest: &Path, data_dir: &Path) {
 
     if !yes {
         tracing::info!(latest = %latest_str, "eullm update declined, staying on version {current_version}");
-        ov.declined_version = Some(latest_str);
-        save_eullm_override(data_dir, &ov).await;
+        ov.declined_version = Some(latest_str.clone());
+        if let Err(e) = save_eullm_override(data_dir, &ov).await {
+            tracing::warn!(
+                error = ?e,
+                "eullm: the refusal of {latest_str} was not recorded - the same version will be \
+                 offered again on the next start"
+            );
+        }
         return;
     }
 
@@ -1782,7 +1836,7 @@ async fn maybe_update_eullm(pinned: &Component, dest: &Path, data_dir: &Path) {
     if pinned.exec {
         let _ = set_executable(dest).await;
     }
-    write_stamp(dest, &sha256).await;
+    stamp_installed(dest, &sha256, "eullm").await;
 
     tracing::warn!(
         version = %latest_str,
@@ -1793,11 +1847,17 @@ async fn maybe_update_eullm(pinned: &Component, dest: &Path, data_dir: &Path) {
          to pin it in manifest.toml in a future update of the repository."
     );
 
-    ov.installed_version = Some(latest_str);
+    ov.installed_version = Some(latest_str.clone());
     ov.installed_sha256 = Some(sha256);
     ov.installed_url = Some(asset.browser_download_url.clone());
     ov.declined_version = None;
-    save_eullm_override(data_dir, &ov).await;
+    if let Err(e) = save_eullm_override(data_dir, &ov).await {
+        tracing::warn!(
+            error = ?e,
+            "eullm: {latest_str} is installed, but the approval could not be recorded - on the next \
+             start the manifest's pinned build will be downloaded over it"
+        );
+    }
 }
 
 // ── Disk space ────────────────────────────────────────────────────────────────
@@ -2796,5 +2856,171 @@ mod stale_process_tests {
             Path::new("/home/someone/other/bin/eullm"),
             Path::new("/opt/rag/bin/eullm")
         ));
+    }
+}
+
+/// Both bootstrap state files - the `{dest}.sha2` stamp and
+/// `bin/eullm.override.json` - are what stops a component being fetched again
+/// on the next start. A write that quietly fails therefore does not merely
+/// lose a file: it reverts an update the operator approved, and sends the
+/// next start downloading a build they already refused to stay on.
+#[cfg(test)]
+mod state_write_tests {
+    use super::*;
+
+    /// A data dir with the layout `bootstrap_data_dir` establishes, `bin/`
+    /// included: the override lives under it and nothing here creates it.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("i3k_bootstrap_state_{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).expect("create scratch dir");
+        dir
+    }
+
+    fn pinned(sha: &str) -> Component {
+        Component {
+            name: "eullm".to_owned(),
+            version: Some("0.6.6".to_owned()),
+            kind: "binary".to_owned(),
+            target: None,
+            url: "https://example.invalid/eullm.zip".to_owned(),
+            sha256: sha.to_owned(),
+            size: 1,
+            dest: "{data}/bin/eullm".to_owned(),
+            exec: true,
+            archive_member: None,
+            unpack_dir: false,
+        }
+    }
+
+    /// A stamp that cannot be written has to surface as an error. Reporting
+    /// success here is what let the failure reach production unnoticed.
+    #[tokio::test]
+    async fn write_stamp_reports_a_stamp_it_could_not_write() {
+        let dir = scratch("stamp_dir");
+        // A directory where the stamp file belongs: the write cannot succeed,
+        // and no amount of retrying will make it.
+        let dest = dir.join("component");
+        std::fs::create_dir_all(stamp_path(&dest)).expect("create dir in the stamp's place");
+
+        let err = write_stamp(&dest, "abc123")
+            .await
+            .expect_err("writing a stamp over a directory must fail");
+        assert!(
+            err.to_string().contains("stamp"),
+            "the error should name the path it tried to write: {err}"
+        );
+    }
+
+    /// The happy path still has to round-trip: the stamp is only a fast path,
+    /// so a regression here shows up as a slow start rather than a failure,
+    /// which is exactly the kind of regression that goes unnoticed.
+    #[tokio::test]
+    async fn write_stamp_round_trips_through_verify_component() {
+        let dir = scratch("stamp_round_trip");
+        let dest = dir.join("component");
+        tokio::fs::write(&dest, b"payload").await.expect("seed dest");
+
+        // verify_component rehashes the file, so the pin has to carry the
+        // digest of what is actually there.
+        let digest = sha256_file(&dest).expect("hash the payload");
+        let comp = pinned(&digest);
+
+        assert!(
+            verify_component(&comp, &dest).await.expect("verify"),
+            "a freshly written file matches the hash just stamped"
+        );
+
+        let stamped = tokio::fs::read_to_string(stamp_path(&dest))
+            .await
+            .expect("read the stamp back");
+        assert_eq!(stamped.trim(), comp.sha256);
+
+        // A different component must not be accepted by the stale stamp.
+        let other = pinned(&"b".repeat(64));
+        assert!(
+            !verify_component(&other, &dest).await.expect("verify"),
+            "a stamp for a different sha256 must not vouch for this file"
+        );
+    }
+
+    /// Same contract for the eullm override: a write that did not happen has
+    /// to be an error, so the caller can warn about what the next start will
+    /// do instead of finding out from a re-download.
+    #[tokio::test]
+    async fn save_eullm_override_reports_a_write_it_could_not_make() {
+        let dir = scratch("override_write");
+        let path = eullm_override_path(&dir);
+        std::fs::create_dir_all(&path).expect("create dir in the override's place");
+
+        let ov = EullmOverride {
+            installed_version: Some("0.6.7".to_owned()),
+            ..EullmOverride::default()
+        };
+        save_eullm_override(&dir, &ov)
+            .await
+            .expect_err("writing the override over a directory must fail");
+    }
+
+    #[tokio::test]
+    async fn eullm_override_round_trips_and_a_corrupt_file_falls_back_to_the_pin() {
+        let dir = scratch("override_round_trip");
+        let ov = EullmOverride {
+            installed_version: Some("0.6.7".to_owned()),
+            installed_sha256: Some("c".repeat(64)),
+            installed_url: Some("https://example.invalid/eullm-0.6.7.zip".to_owned()),
+            declined_version: None,
+        };
+        save_eullm_override(&dir, &ov).await.expect("save override");
+
+        let loaded = load_eullm_override(&dir).await;
+        assert_eq!(loaded.installed_version.as_deref(), Some("0.6.7"));
+        assert_eq!(loaded.installed_sha256, ov.installed_sha256);
+
+        // The override exists and is used - this is the state a failed write
+        // would leave behind.
+        let effective = effective_eullm_component(&pinned("a".repeat(64).as_str()), &dir).await;
+        assert_eq!(effective.sha256, "c".repeat(64));
+
+        // Half-written JSON must not take the whole bootstrap down, and must
+        // resolve to the pinned build rather than to nothing.
+        tokio::fs::write(eullm_override_path(&dir), b"{\"installed_ver")
+            .await
+            .expect("corrupt the override");
+        let recovered = load_eullm_override(&dir).await;
+        assert_eq!(recovered.installed_version, None);
+        assert_eq!(
+            effective_eullm_component(&pinned("a".repeat(64).as_str()), &dir)
+                .await
+                .sha256,
+            "a".repeat(64),
+            "an unreadable override falls back to the manifest pin"
+        );
+    }
+
+    /// The pin only stops being consulted once the pin catches up with the
+    /// override. Until then the locally approved build is the one to install,
+    /// and an override the manifest has overtaken must be dropped - including
+    /// when dropping it cannot be written, which must not stop the reset.
+    #[tokio::test]
+    async fn a_stale_override_is_dropped_even_when_it_cannot_be_written() {
+        let dir = scratch("override_stale");
+        let ov = EullmOverride {
+            installed_version: Some("0.6.5".to_owned()),
+            installed_sha256: Some("d".repeat(64)),
+            installed_url: Some("https://example.invalid/eullm-0.6.5.zip".to_owned()),
+            declined_version: None,
+        };
+        save_eullm_override(&dir, &ov).await.expect("save override");
+
+        // The pin has moved past the override, so the override is obsolete.
+        let mut pin = pinned("a".repeat(64).as_str());
+        pin.version = Some("0.6.6".to_owned());
+        let effective = effective_eullm_component(&pin, &dir).await;
+        assert_eq!(
+            effective.sha256,
+            "a".repeat(64),
+            "the pin wins once it has caught up with the override"
+        );
     }
 }
