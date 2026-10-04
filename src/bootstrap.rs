@@ -2289,6 +2289,26 @@ mod eullm_tags_tests {
 
 // ── Parallel multi-chunk download ─────────────────────────────────────────────
 
+/// The total size of the file, read out of the `Content-Range` of a `206`
+/// answer to `Range: bytes=0-0`: `bytes 0-0/{total}`, in that same response,
+/// with no separate request.
+///
+/// `None` when the header is absent, malformed, names no size (`bytes 0-0/*`)
+/// or says zero - and the caller must then NOT treat the probe response as the
+/// file. A `206` is a range response: its body is the range that was asked for,
+/// so `probe` holds the single byte we requested and nothing else. Reusing it
+/// would write that one byte out as the whole component, which a pinned sha256
+/// catches and the eullm self-update, having no sha256 to compare against,
+/// would install as a working binary.
+fn probe_total(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.rsplit('/').next())
+        .and_then(|s| s.parse().ok())
+        .filter(|&total| total > 0)
+}
+
 async fn parallel_download(url: &str, dest: &Path, display_name: &str, n: usize) -> Result<()> {
     // http1_only: if the server negotiates HTTP/2, reqwest would multiplex the
     // N "concurrent" Range requests over the SAME TCP connection — no real
@@ -2335,27 +2355,30 @@ async fn parallel_download(url: &str, dest: &Path, display_name: &str, n: usize)
     let final_url = probe.url().to_string();
     let accepts_ranges = probe_status == reqwest::StatusCode::PARTIAL_CONTENT;
 
-    let total: u64 = if accepts_ranges {
-        probe
-            .headers()
-            .get(reqwest::header::CONTENT_RANGE)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.rsplit('/').next())
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0)
-    } else {
-        probe
-            .headers()
-            .get(reqwest::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0)
-    };
-
-    if total == 0 || !accepts_ranges {
+    if !accepts_ranges {
         tracing::info!("{display_name}: streaming download (Range not supported)");
         return download_streaming(probe, dest, display_name).await;
     }
+
+    let Some(total) = probe_total(probe.headers()) else {
+        // Range works but the size did not come with it, so there is nothing
+        // here to download from. Ask again without a Range header, the way the
+        // 416 branch above does, rather than writing out the one byte the probe
+        // holds.
+        drop(probe);
+        tracing::info!(
+            "{display_name}: 206 without a usable Content-Range, retrying without Range"
+        );
+        let full = client
+            .get(url)
+            .send()
+            .await
+            .context("GET (no usable Content-Range)")?;
+        if !full.status().is_success() {
+            bail!("HTTP {} - {display_name} ({url})", full.status());
+        }
+        return download_streaming(full, dest, display_name).await;
+    };
     drop(probe);
 
     {
@@ -2796,5 +2819,41 @@ mod stale_process_tests {
             Path::new("/home/someone/other/bin/eullm"),
             Path::new("/opt/rag/bin/eullm")
         ));
+    }
+}
+
+/// The probe is what decides whether a parallel download can happen at all, so
+/// the one thing `probe_total` must never do is invent a size - least of all
+/// zero, which the caller would take as "stream the probe response", the probe
+/// being the single byte `Range: bytes=0-0` asked for.
+#[cfg(test)]
+mod probe_total_tests {
+    use super::*;
+    use reqwest::header::{HeaderMap, CONTENT_RANGE};
+
+    fn with_range(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_RANGE, value.parse().expect("a header value"));
+        headers
+    }
+
+    #[test]
+    fn the_size_is_taken_from_the_content_range_of_the_probe() {
+        assert_eq!(probe_total(&with_range("bytes 0-0/1234")), Some(1234));
+        // A multi-range answer would still end in the total.
+        assert_eq!(probe_total(&with_range("bytes 0-1233/1234")), Some(1234));
+    }
+
+    #[test]
+    fn a_probe_that_says_nothing_usable_reports_no_size() {
+        // Absent: a 206 without it, which broken proxies do send.
+        assert_eq!(probe_total(&HeaderMap::new()), None);
+        // `*` is the legal way to say "I will not say".
+        assert_eq!(probe_total(&with_range("bytes 0-0/*")), None);
+        // A zero total is not a file to divide into chunks.
+        assert_eq!(probe_total(&with_range("bytes 0-0/0")), None);
+        // Nonsense, and a size that does not fit the type.
+        assert_eq!(probe_total(&with_range("bytes 0-0/lots")), None);
+        assert_eq!(probe_total(&with_range("garbage")), None);
     }
 }
