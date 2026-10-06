@@ -1829,12 +1829,28 @@ async fn maybe_update_eullm(pinned: &Component, dest: &Path, data_dir: &Path) {
         }
     };
 
+    // Make it runnable BEFORE it replaces the binary that is working: a mode
+    // change travels with the inode across a rename, so doing it here costs
+    // nothing and keeps a failure from being destructive. After the rename,
+    // a chmod that did not take leaves an eullm that cannot be launched -
+    // stamped as verified, announced as "eullm updated", and believed by
+    // `verify_component` on the next start, which then fails to spawn it with
+    // a permission error that names nothing about an update.
+    if pinned.exec {
+        if let Err(e) = set_executable(&partial).await {
+            tracing::warn!(
+                error = ?e,
+                "eullm {latest_str} could not be made executable, discarding it - the installed \
+                 version is untouched"
+            );
+            let _ = tokio::fs::remove_file(&partial).await;
+            return;
+        }
+    }
+
     if let Err(e) = tokio::fs::rename(&partial, dest).await {
         tracing::warn!(error = ?e, "could not install eullm {latest_str}");
         return;
-    }
-    if pinned.exec {
-        let _ = set_executable(dest).await;
     }
     stamp_installed(dest, &sha256, "eullm").await;
 
