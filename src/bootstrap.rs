@@ -1434,17 +1434,16 @@ async fn verify_component(comp: &Component, dest: &Path) -> Result<bool> {
                         "{}: installed but not executable, restoring the permission",
                         comp.name
                     );
-                    if set_executable(dest).await.is_ok() {
-                        return Ok(true);
+                    if let Err(e) = set_executable(dest).await {
+                        // Not even that: a binary that cannot be run is not
+                        // installed, so let the caller provision it again.
+                        tracing::warn!(
+                            error = ?e,
+                            "{}: could not make it executable, treating it as not installed",
+                            comp.name
+                        );
+                        return Ok(false);
                     }
-                    // The permission could not be restored either, so this is
-                    // no longer an install problem: fall through and let the
-                    // caller see it as missing, which is what it is.
-                    tracing::warn!(
-                        "{}: could not make it executable, treating it as not installed",
-                        comp.name
-                    );
-                    return Ok(false);
                 }
                 return Ok(true);
             }
