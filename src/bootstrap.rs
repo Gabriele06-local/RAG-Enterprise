@@ -1486,8 +1486,8 @@ fn stamp_path(dest: &Path) -> PathBuf {
 ///
 /// The stamp records a digest, and a digest says nothing about a permission:
 /// it is set before `set_executable` runs, so a file whose `chmod` failed is
-/// stamped exactly like one that is ready. Nothing here is a no-op on Windows,
-/// where `.exe` is what makes a file runnable and there is no mode bit to lose.
+/// stamped exactly like one that is ready. Always true on Windows, where
+/// `.exe` is what makes a file runnable and there is no mode bit to lose.
 #[cfg(unix)]
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
