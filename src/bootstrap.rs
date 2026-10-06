@@ -1418,6 +1418,33 @@ async fn verify_component(comp: &Component, dest: &Path) -> Result<bool> {
     if stamp_path.exists() {
         if let Ok(stamped) = tokio::fs::read_to_string(&stamp_path).await {
             if stamped.trim() == comp.sha256 {
+                // A stamp means "installed and ready", and for a binary that
+                // includes being runnable. `ensure_component` sets the stamp
+                // before it chmods, so a `chmod` that failed leaves a file that
+                // matches perfectly and cannot be run - and the next start
+                // would take this branch and declare it installed, never
+                // touching the permission again.
+                //
+                // Re-take the bit rather than rehash: the digest already agrees,
+                // and rehashing costs tens of seconds on the 2.1GB GGUF to learn
+                // what the stamp just said. This also repairs an install whose
+                // mode was lost afterwards - an unzip, a restore from backup.
+                if comp.exec && !is_executable(dest) {
+                    tracing::warn!(
+                        "{}: installed but not executable, restoring the permission",
+                        comp.name
+                    );
+                    if let Err(e) = set_executable(dest).await {
+                        // Not even that: a binary that cannot be run is not
+                        // installed, so let the caller provision it again.
+                        tracing::warn!(
+                            error = ?e,
+                            "{}: could not make it executable, treating it as not installed",
+                            comp.name
+                        );
+                        return Ok(false);
+                    }
+                }
                 return Ok(true);
             }
         }
@@ -1453,6 +1480,25 @@ fn stamp_path(dest: &Path) -> PathBuf {
     let mut p = dest.to_owned().into_os_string();
     p.push(".sha2");
     PathBuf::from(p)
+}
+
+/// Whether `path` can actually be run.
+///
+/// The stamp records a digest, and a digest says nothing about a permission:
+/// it is set before `set_executable` runs, so a file whose `chmod` failed is
+/// stamped exactly like one that is ready. Always true on Windows, where
+/// `.exe` is what makes a file runnable and there is no mode bit to lose.
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn is_executable(_path: &Path) -> bool {
+    true
 }
 
 /// Records the digest of the file now installed at `dest`.
@@ -3283,5 +3329,113 @@ mod state_write_tests {
             "a".repeat(64),
             "the pin wins once it has caught up with the override"
         );
+    }
+}
+
+/// A stamp records a digest. It is written before `ensure_component` chmods,
+/// so on its own it says nothing about whether the file can be run - and a
+/// binary that cannot be run is not installed.
+///
+/// Unix only, and not by accident: there is no permission bit to lose on
+/// Windows, so there is nothing here for another platform to check.
+#[cfg(all(test, unix))]
+mod executable_stamp_tests {
+    use super::*;
+
+    fn component(digest: &str, exec: bool) -> Component {
+        Component {
+            name: "component".to_owned(),
+            version: None,
+            kind: "binary".to_owned(),
+            target: None,
+            url: "https://example.invalid/component".to_owned(),
+            sha256: digest.to_owned(),
+            size: 7,
+            dest: "{data}/bin/component".to_owned(),
+            exec,
+            archive_member: None,
+            unpack_dir: false,
+        }
+    }
+
+    fn path_for(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("i3k_exec_{name}"));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(stamp_path(&path));
+        path
+    }
+
+    /// A component installed and stamped exactly as a good install is: the
+    /// digest on disk is the one in the manifest, and the stamp says so.
+    async fn staged(name: &str, payload: &[u8]) -> (Component, PathBuf) {
+        let path = path_for(name);
+        std::fs::write(&path, payload).expect("stage the component");
+        let digest = sha256_file(&path).expect("hash the component");
+        write_stamp(&path, &digest)
+            .await
+            .expect("write the stamp");
+        (component(&digest, true), path)
+    }
+
+    #[tokio::test]
+    async fn a_stamped_binary_that_cannot_be_run_is_repaired_not_accepted() {
+        use std::os::unix::fs::PermissionsExt;
+        let (comp, path) = staged("stamped", b"payload").await;
+        // The install the stamp describes, on a filesystem where the chmod
+        // that should have followed it never took.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!is_executable(&path), "precondition: not executable");
+
+        assert!(
+            verify_component(&comp, &path).await.expect("verify"),
+            "the permission must be restored rather than the file called missing"
+        );
+        assert!(
+            is_executable(&path),
+            "and the file must end up runnable"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(stamp_path(&path));
+    }
+
+    #[tokio::test]
+    async fn a_component_that_never_wanted_the_bit_is_accepted_and_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let (comp, path) = staged("model", b"weights").await;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut model = comp.clone();
+        model.exec = false;
+
+        assert!(
+            verify_component(&model, &path).await.expect("verify"),
+            "a model with exec=false is installed whether or not it carries the bit"
+        );
+        assert!(
+            !is_executable(&path),
+            "and nothing may add a permission the manifest did not ask for"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(stamp_path(&path));
+    }
+
+    #[test]
+    fn the_executable_bit_is_about_the_mode_and_nothing_else() {
+        let path = path_for("bits");
+        std::fs::write(&path, b"x").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        // Any of the three, and all three, count: what runs is decided by the
+        // execute bit for whoever is going to run it.
+        for mode in [0o644u32, 0o744, 0o700, 0o755] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let expected = mode & 0o111 != 0;
+            assert_eq!(
+                is_executable(&path),
+                expected,
+                "mode {mode:o} should read as executable={expected}"
+            );
+        }
+        // A file that is not there is not executable, and must not panic.
+        assert!(!is_executable(&path_for("absent")));
+        let _ = std::fs::remove_file(&path);
     }
 }
