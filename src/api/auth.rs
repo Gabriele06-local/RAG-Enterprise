@@ -325,7 +325,7 @@ mod tests {
         assert_eq!(value["id"], 1);
         assert_eq!(value["username"], "alice");
         assert_eq!(value["email"], "alice@example.com");
-assert_eq!(value["role"], "admin");
+        assert_eq!(value["role"], "admin");
     }
 }
 
